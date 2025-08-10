@@ -26,8 +26,10 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "chex>=0.1.90",
     "mypy>=1.17.1",
     "pytest>=8.4.1",
+    "pytest-benchmark>=5.1.0",
     "pytest-cov>=6.2.1",
     "ruff>=0.12.8",
     "sphinx>=8.2.3",

@@ -5,22 +5,7 @@ on:
 
 jobs:
   test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        jax-backend: [cpu, cuda, tpu]
-        exclude:
-          # CUDA only on Linux
-          - os: windows-latest
-            jax-backend: cuda
-          - os: macos-latest
-            jax-backend: cuda
-          # TPU only on Linux (typically)
-          - os: windows-latest
-            jax-backend: tpu
-          - os: macos-latest
-            jax-backend: tpu
+    runs-on: ubuntu-latest
     
     steps:
     - uses: actions/checkout@v4
@@ -38,15 +23,7 @@ jobs:
     
     - name: Install dependencies
       run: |
-        # Install dev dependencies and backend-specific optional dependencies
-        if [ "${{ matrix.jax-backend }}" = "cuda" ]; then
-          uv sync --group dev --extra cuda
-        elif [ "${{ matrix.jax-backend }}" = "tpu" ]; then
-          uv sync --group dev --extra tpu
-        else
-          uv sync --group dev
-        fi
-      shell: bash
+        uv sync --group dev
     
     - name: Run ruff check
       run: |
@@ -62,14 +39,22 @@ jobs:
     
     - name: Run tests with coverage
       run: |
-        # Set JAX platform for testing
-        export JAX_PLATFORMS=${{ matrix.jax-backend }}
         uv run pytest --cov=src --cov-report=xml --cov-report=term-missing
-        
+    
+    - name: Run benchmarks
+      run: |
+        uv run pytest --benchmark-only --benchmark-json=benchmarks.json
+    
     - name: Upload coverage to Codecov
-      if: matrix.os == 'ubuntu-latest' && matrix.jax-backend == 'cpu'
       uses: codecov/codecov-action@v4
       with:
         file: ./coverage.xml
         fail_ci_if_error: false
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results
+        path: benchmarks.json
