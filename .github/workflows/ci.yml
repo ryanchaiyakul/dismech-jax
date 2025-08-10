@@ -1,0 +1,75 @@
+name: CI
+on: 
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        jax-backend: [cpu, cuda, tpu]
+        exclude:
+          # CUDA only on Linux
+          - os: windows-latest
+            jax-backend: cuda
+          - os: macos-latest
+            jax-backend: cuda
+          # TPU only on Linux (typically)
+          - os: windows-latest
+            jax-backend: tpu
+          - os: macos-latest
+            jax-backend: tpu
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python from .python-version
+      uses: actions/setup-python@v5
+      with:
+        python-version-file: '.python-version'
+        allow-prereleases: true
+    
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        version: "latest"
+    
+    - name: Install dependencies
+      run: |
+        # Install dev dependencies and backend-specific optional dependencies
+        if [ "${{ matrix.jax-backend }}" = "cuda" ]; then
+          uv sync --group dev --extra cuda
+        elif [ "${{ matrix.jax-backend }}" = "tpu" ]; then
+          uv sync --group dev --extra tpu
+        else
+          uv sync --group dev
+        fi
+      shell: bash
+    
+    - name: Run ruff check
+      run: |
+        uv run ruff check
+    
+    - name: Run ruff format check
+      run: |
+        uv run ruff format --check
+    
+    - name: Run mypy
+      run: |
+        uv run mypy
+    
+    - name: Run tests with coverage
+      run: |
+        # Set JAX platform for testing
+        export JAX_PLATFORMS=${{ matrix.jax-backend }}
+        uv run pytest --cov=src --cov-report=xml --cov-report=term-missing
+        
+    - name: Upload coverage to Codecov
+      if: matrix.os == 'ubuntu-latest' && matrix.jax-backend == 'cpu'
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+    
