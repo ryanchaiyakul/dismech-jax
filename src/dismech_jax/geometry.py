@@ -1,7 +1,7 @@
 from __future__ import annotations
 import itertools
 import os
-import typing
+from pathlib import Path
 
 import numpy as np
 
@@ -134,7 +134,7 @@ class Geometry:
             ghost_rod_shell_joint_edges += list(shell_edges[s_edges])
 
         # remove jugaad
-        self.__rod_shell_joint_edges_total = np.concat(
+        self.__rod_shell_joint_edges_total: np.ndarray = np.concat(
             (self.__rod_shell_joint_edges, ghost_rod_shell_joint_edges[1:]), 0
         )
 
@@ -264,10 +264,10 @@ class Geometry:
             n1, n2, n3 = face_nodes[i]
 
             # edge between first 2 nodes
-            permutations = [(n2, n3), (n3, n1), (n1, n2)]
+            face_permutations = [(n2, n3), (n3, n1), (n1, n2)]
 
             # pick pos/neg edge depending on sign_faces
-            for j, (n1, n2) in enumerate(permutations):
+            for j, (n1, n2) in enumerate(face_permutations):
                 self.__face_edges[i][j] = (
                     np.where((self.edges == [n1, n2]).all(axis=1))[0][0]
                     if self.__sign_faces[i][j] > 0
@@ -275,7 +275,6 @@ class Geometry:
                 )
 
         # Twist angles
-        # TODO: Make this mutable
         self.__twist_angles = np.zeros(
             n_rod_edges + np.size(self.__rod_shell_joint_edges_total, 0)
         )
@@ -296,10 +295,10 @@ class Geometry:
             return np.empty((0, 2))  # always edge
 
     @staticmethod
-    def from_txt(fname: str) -> Geometry:
+    def from_txt(fname: str | Path) -> Geometry:
         """Reads from a .txt file and returns a Geometry object. Uses the same convention as the Matlab version."""
 
-        def process_temp_array(header_index):
+        def process_temp_array(header_index: int) -> None:
             """Converts temp_array to a NumPy array and adjusts for zero-based indexing if needed."""
             if temp_array:
                 params[header_index] = np.array(temp_array, dtype=h_dtype[header_index])
@@ -352,7 +351,9 @@ class Geometry:
         return Geometry(*params)
 
     @staticmethod
-    def __separate_joint_edges(triangles: np.ndarray, edges: np.ndarray):
+    def __separate_joint_edges(
+        triangles: np.ndarray, edges: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
         if edges.size == 0:
             return np.empty(0), np.empty(0)
 
@@ -372,69 +373,69 @@ class Geometry:
         ), edges[~is_joint_edge]
 
     @property
-    def nodes(self):
+    def nodes(self) -> np.ndarray:
         return self.__nodes
 
     @property
-    def edges(self):
+    def edges(self) -> np.ndarray:
         return self.__edges
 
     @property
-    def rod_edges(self):
+    def rod_edges(self) -> np.ndarray:
         return self.__rod_edges
 
     @property
-    def shell_edges(self):
+    def shell_edges(self) -> np.ndarray:
         return self.__shell_edges
 
     @property
-    def rod_shell_joint_edges(self):
+    def rod_shell_joint_edges(self) -> np.ndarray:
         return self.__rod_shell_joint_edges
 
     @property
-    def rod_shell_joint_edges_total(self):
+    def rod_shell_joint_edges_total(self) -> np.ndarray:
         return self.__rod_shell_joint_edges_total
 
     @property
-    def face_nodes(self):
+    def face_nodes(self) -> np.ndarray:
         return self.__face_nodes
 
     @property
-    def face_edges(self):
+    def face_edges(self) -> np.ndarray:
         return self.__face_edges
 
     @property
-    def face_shell_edges(self):
+    def face_shell_edges(self) -> np.ndarray:
         return self.__face_shell_edges
 
     @property
-    def rod_stretch_springs(self):
+    def rod_stretch_springs(self) -> np.ndarray:
         return self.__rod_stretch_springs
 
     @property
-    def shell_stretch_springs(self):
+    def shell_stretch_springs(self) -> np.ndarray:
         return self.__shell_stretch_springs
 
     @property
-    def bend_twist_springs(self):
+    def bend_twist_springs(self) -> np.ndarray:
         return self.__bend_twist_springs
 
     @property
-    def bend_twist_signs(self):
+    def bend_twist_signs(self) -> np.ndarray:
         return self.__bend_twist_signs
 
     @property
-    def hinges(self):
+    def hinges(self) -> np.ndarray:
         return self.__hinges
 
     @property
-    def sign_faces(self):
+    def sign_faces(self) -> np.ndarray:
         return self.__sign_faces
 
     @property
-    def face_unit_norms(self):
+    def face_unit_norms(self) -> np.ndarray:
         return self.__face_unit_norms
 
     @property
-    def twist_angles(self):
+    def twist_angles(self) -> np.ndarray:
         return self.__twist_angles

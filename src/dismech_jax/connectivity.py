@@ -3,10 +3,10 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-from jax.typing import ArrayLike
 from jax.tree_util import register_dataclass
 
 from .geometry import Geometry
+from .util import map_node_to_dof
 
 
 @register_dataclass
@@ -32,7 +32,7 @@ class Connectivity:
     ) -> Connectivity:
         """Create intermediate constructs from nodes, edges, and traingles (tbd)"""
         return Connectivity(
-            edge_node_dofs=cls.map_node_to_dof(edges)
+            edge_node_dofs=map_node_to_dof(edges)
             if edges.size
             else jnp.empty((0, 2, 3), dtype=edges.dtype),
             edge_dofs=jnp.arange(
@@ -51,7 +51,3 @@ class Connectivity:
             jnp.asarray(geo.bend_twist_springs, dtype=jnp.int32),
             jnp.asarray(geo.bend_twist_signs, dtype=jnp.int32),
         )
-
-    @staticmethod
-    def map_node_to_dof(n: ArrayLike) -> jax.Array:
-        return 3 * jnp.asarray(n)[..., None] + jnp.arange(3)

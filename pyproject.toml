@@ -33,6 +33,7 @@ dev = [
     "pytest-benchmark>=5.1.0",
     "pytest-cov>=6.2.1",
     "ruff>=0.12.8",
+    "scipy-stubs>=1.16.1.0",
     "sphinx>=8.2.3",
     "tensorflow>=2.20.0rc0",
 ]
