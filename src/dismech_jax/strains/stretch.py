@@ -13,26 +13,24 @@ def _get_strain(n0: jax.Array, n1: jax.Array, l_k: jax.Array) -> jax.Array:
 def _get_grad_strain(
     n0: jax.Array, n1: jax.Array, l_k: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-    # Strain
     edge = n1 - n0
     edge_len = jnp.linalg.norm(edge)
-    epsx = edge_len / l_k - 1.0
+    eps = edge_len / l_k - 1.0
 
     # Gradient
     tangent = edge / edge_len
     dF_unit = tangent / l_k
     dF = jnp.concatenate((-dF_unit, dF_unit))
-    return epsx, dF
+    return eps, dF
 
 
 @jax.jit
 def _get_grad_hess_strain(
     n0: jax.Array, n1: jax.Array, l_k: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    # Strain
     edge = n1 - n0
     edge_len = jnp.linalg.norm(edge)
-    epsx = edge_len / l_k - 1.0
+    eps = edge_len / l_k - 1.0
 
     # Gradient
     tangent = edge / edge_len
@@ -44,9 +42,9 @@ def _get_grad_hess_strain(
     K_term = 1 / edge_len * (jnp.outer(edge, edge)) / edge_len**2
     M = 2.0 / l_k * ((1 / l_k - 1 / edge_len) * Id3 + K_term)
     M2 = jnp.where(
-        jnp.isclose(epsx, 0.0),
+        jnp.isclose(eps, 0.0),
         jnp.zeros_like(M),
-        1.0 / (2.0 * epsx) * (M - 2.0 * jnp.outer(dF_unit, dF_unit)),
+        1.0 / (2.0 * eps) * (M - 2.0 * jnp.outer(dF_unit, dF_unit)),
     )
     dJ = jnp.block(
         [
@@ -54,7 +52,7 @@ def _get_grad_hess_strain(
             [-M2, M2],
         ]
     )
-    return epsx, dF, dJ
+    return eps, dF, dJ
 
 
 @jax.jit
@@ -70,9 +68,7 @@ def get_grad_stretch_strain(
 ) -> tuple[jax.Array, jax.Array]:
     epsx0, dF0 = _get_grad_strain(n0, n1, l_k0)
     epsx1, dF1 = _get_grad_strain(n1, n2, l_k1)
-
-    # Strain
-    epsx = 0.5 * (epsx0 + epsx1)
+    eps = 0.5 * (epsx0 + epsx1)
 
     # Gradient
     dF0_n0 = dF0[:3]
@@ -80,7 +76,7 @@ def get_grad_stretch_strain(
     dF1_n1 = dF1[:3]
     dF1_n2 = dF1[3:]
     dF = 0.5 * jnp.concatenate([dF0_n0, dF0_n1 + dF1_n1, dF1_n2])
-    return epsx, dF
+    return eps, dF
 
 
 @jax.jit
@@ -89,9 +85,7 @@ def get_grad_hess_stretch_strain(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     epsx0, dF0, dJ0 = _get_grad_hess_strain(n0, n1, l_k0)
     epsx1, dF1, dJ1 = _get_grad_hess_strain(n1, n2, l_k1)
-
-    # Strain
-    epsx = 0.5 * (epsx0 + epsx1)
+    eps = 0.5 * (epsx0 + epsx1)
 
     # Gradient
     dF0_n0 = dF0[:3]
@@ -117,4 +111,4 @@ def get_grad_hess_stretch_strain(
             [jnp.zeros((3, 3)), J21_prime, J22_prime],
         ]
     )
-    return epsx, dF, dJ
+    return eps, dF, dJ
