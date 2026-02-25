@@ -5,7 +5,8 @@ import jax.numpy as jnp
 import equinox as eqx
 
 from ..models import DER
-from ..stencils import Triplet, TripletAux
+from ..stencils import Triplet
+from ..states import TripletState
 from ..params import Geometry, Material
 from .system import System
 
@@ -18,7 +19,7 @@ class BC(eqx.Module):
     xb_c: jax.Array
 
 
-class Rod(System[TripletAux]):
+class Rod(System[TripletState]):
     triplets: Triplet
     F_ext: jax.Array
     bc: BC
@@ -26,7 +27,7 @@ class Rod(System[TripletAux]):
     @classmethod
     def from_geometry(
         cls, geom: Geometry, material: Material, N: int = 30
-    ) -> tuple[Rod, jax.Array, TripletAux]:
+    ) -> tuple[Rod, jax.Array, TripletState]:
         if N < 3:
             raise ValueError("Cannot create a rod with less than 3 nodes.")
         if geom.length < 1e-6:
@@ -51,7 +52,7 @@ class Rod(System[TripletAux]):
         d1s = jnp.broadcast_to(d1_pair, (N_triplets, 2, 3))
         betas = jnp.zeros(N_triplets)
 
-        batch_aux = jax.vmap(TripletAux)(ts, d1s, betas)
+        batch_aux = jax.vmap(TripletState)(ts, d1s, betas)
         triplets = jax.vmap(lambda q, a, l_k: Triplet.init(q, a, l_k=l_k))(
             batch_q, batch_aux, batch_l_ks
         )
@@ -70,19 +71,19 @@ class Rod(System[TripletAux]):
     def get_q(self, _lambda: jax.Array, q0: jax.Array) -> jax.Array:
         return q0.at[self.bc.idx_b].set(self.bc.xb_m * _lambda + self.bc.xb_c)
 
-    def get_F(self, q: jax.Array, model: eqx.Module, aux: TripletAux) -> jax.Array:
+    def get_F(self, q: jax.Array, model: eqx.Module, aux: TripletState) -> jax.Array:
         mask = jnp.ones_like(q).at[self.bc.idx_b].set(0.0)
         F_int = jax.grad(self.get_energy, 0)(q, model, aux)
         return mask * (self.F_ext - F_int)
 
-    def get_H(self, q: jax.Array, model: eqx.Module, aux: TripletAux) -> jax.Array:
+    def get_H(self, q: jax.Array, model: eqx.Module, aux: TripletState) -> jax.Array:
         mask = jnp.ones_like(q).at[self.bc.idx_b].set(0.0)
         H = jax.hessian(self.get_energy, 0)(q, model, aux)
         H = H * mask[:, None] * mask[None, :]
         diag_idx = jnp.arange(H.shape[0])
         return H.at[diag_idx, diag_idx].add(1.0 - mask)
 
-    def get_energy(self, q: jax.Array, model: eqx.Module, aux: TripletAux) -> jax.Array:
+    def get_energy(self, q: jax.Array, model: eqx.Module, aux: TripletState) -> jax.Array:
         batch_qs = self.global_q_to_batch_q(q)
         return jnp.sum(
             jax.vmap(lambda t, q_loc, _aux: t.get_energy(q_loc, model, _aux))(

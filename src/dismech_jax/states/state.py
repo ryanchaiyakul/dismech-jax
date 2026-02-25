@@ -5,6 +5,6 @@ import jax
 import equinox as eqx
 
 
-class Aux(eqx.Module):
+class State(eqx.Module):
     @abstractmethod
     def update(self, q: jax.Array) -> Self: ...

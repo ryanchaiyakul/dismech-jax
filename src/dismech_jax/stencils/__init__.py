@@ -1,1 +1,1 @@
-from .triplet import Triplet, TripletAux
+from .triplet import Triplet

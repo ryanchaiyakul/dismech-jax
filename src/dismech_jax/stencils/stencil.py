@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from ..aux import Aux
+from ..states import State
 
 
 class Stencil(eqx.Module):
@@ -14,12 +14,12 @@ class Stencil(eqx.Module):
     bar_strain: jax.Array
 
     @classmethod
-    def init(cls, q: jax.Array, aux: Aux | None = None, **kwargs) -> Self:
+    def init(cls, q: jax.Array, aux: State | None = None, **kwargs) -> Self:
         """Get a Stencil instance with an initial configuration.
 
         Args:
             q (jax.Array): local DOFs.
-            aux (Aux | None, optional): Aux variables. Defaults to None.
+            aux (State | None, optional): Aux variables. Defaults to None.
 
         Returns:
             Self: Stencil instance
@@ -29,14 +29,14 @@ class Stencil(eqx.Module):
         return cls(bar_strain=bar_strain, **kwargs)
 
     def get_energy(
-        self, q: jax.Array, model: eqx.Module, aux: Aux | None = None
+        self, q: jax.Array, model: eqx.Module, aux: State | None = None
     ) -> jax.Array:
         """Get scalar energy.
 
         Args:
             q (jax.Array): local DOFs.
             model (eqx.Module): Equinox model: `f(del_strain)-> scalar`.
-            aux (Aux | None, optional): Aux variables. Defaults to None.
+            aux (State | None, optional): Aux variables. Defaults to None.
 
         Returns:
             jax.Array: Scalar energy.
@@ -45,12 +45,12 @@ class Stencil(eqx.Module):
         return model(del_strain)
 
     @abstractmethod
-    def get_strain(self, q: jax.Array, aux: Aux | None = None) -> jax.Array:
+    def get_strain(self, q: jax.Array, aux: State | None = None) -> jax.Array:
         """Get strain vector.
 
         Args:
             q (jax.Array): local DOFs.
-            aux (Aux | None, optional): Aux variables. Defaults to None.
+            aux (State | None, optional): Aux variables. Defaults to None.
 
         Returns:
             jax.Array: strain vector.

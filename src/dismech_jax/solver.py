@@ -2,12 +2,12 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-from .aux import Aux
+from .states import State
 from .systems import System
 
 
 def compute_ift_gradient(
-    q_star: jax.Array, grad_obj: jax.Array, model: eqx.Module, aux: Aux, sys: System
+    q_star: jax.Array, grad_obj: jax.Array, model: eqx.Module, aux: State, sys: System
 ) -> eqx.Module:
     H = sys.get_H(q_star, model, aux)
     v = jnp.linalg.solve(H + 1e-8 * jnp.eye(H.shape[0]), grad_obj)
@@ -22,7 +22,7 @@ def solve_step(
     model: eqx.Module,
     _lambda: jax.Array,
     q0: jax.Array,
-    aux: Aux,
+    aux: State,
     sys: System,
     iters: int = 10,
 ) -> jax.Array:
@@ -44,7 +44,7 @@ def solve_step_fwd(
     model: eqx.Module,
     _lambda: jax.Array,
     q0: jax.Array,
-    aux: Aux,
+    aux: State,
     sys: System,
     iters: int = 10,
 ) -> tuple[jax.Array, jax.Array]:
@@ -60,7 +60,7 @@ def solve_step_bwd(
     model: eqx.Module,
     _lambda: jax.Array,
     q0: jax.Array,
-    aux: Aux,
+    aux: State,
     sys: System,
     iters: int = 10,
 ) -> eqx.Module:
@@ -73,11 +73,11 @@ def solve(
     model: eqx.Module,
     lambdas: jax.Array,
     q0: jax.Array,
-    aux: Aux,
+    aux: State,
     sys: System,
     iters: int = 10,
 ) -> jax.Array:
-    def scan_fn(res: tuple[jax.Array, Aux], _lambda: jax.Array):
+    def scan_fn(res: tuple[jax.Array, State], _lambda: jax.Array):
         _q, _aux = res
         new_q = solve_step(model, _lambda, _q, _aux, sys, iters)
         new_aux = jax.vmap(lambda a: a.update(new_q))(_aux)
@@ -93,11 +93,11 @@ def solve_fwd(
     model: eqx.Module,
     lambdas: jax.Array,
     q0: jax.Array,
-    aux: Aux,
+    aux: State,
     sys: System,
     iters: int = 10,
-) -> tuple[jax.Array, tuple[jax.Array, Aux]]:
-    def scan_fwd_fn(res: tuple[jax.Array, Aux], _lambda: jax.Array):
+) -> tuple[jax.Array, tuple[jax.Array, State]]:
+    def scan_fwd_fn(res: tuple[jax.Array, State], _lambda: jax.Array):
         _q, _aux = res
         new_q = solve_step(model, _lambda, _q, _aux, sys, iters)
         new_aux = jax.vmap(lambda a: a.update(new_q))(_aux)
@@ -115,7 +115,7 @@ def solve_bwd(
     model: eqx.Module,
     lambdas: jax.Array,
     q0: jax.Array,
-    aux: Aux,
+    aux: State,
     sys,
     iters: int = 10,
 ) -> eqx.Module:

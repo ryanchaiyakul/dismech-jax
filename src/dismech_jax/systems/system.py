@@ -4,9 +4,9 @@ from typing import Generic, TypeVar
 import jax
 import equinox as eqx
 
-from ..aux import Aux
+from ..states import State
 
-AuxT = TypeVar("AuxT", bound=Aux)
+AuxT = TypeVar("AuxT", bound=State)
 
 
 class System(eqx.Module, Generic[AuxT]):
