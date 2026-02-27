@@ -1,6 +1,6 @@
-import equinox as eqx
 import jax
 import jax.numpy as jnp
+import equinox as eqx
 
 from ..params import Geometry, Material
 
