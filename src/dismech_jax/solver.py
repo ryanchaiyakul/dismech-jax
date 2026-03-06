@@ -7,13 +7,18 @@ from .systems import System
 
 
 def compute_ift_gradient(
-    q_star: jax.Array, grad_obj: jax.Array, model: eqx.Module, aux: State, sys: System
+    _lambda: jax.Array,
+    q_star: jax.Array,
+    grad_obj: jax.Array,
+    model: eqx.Module,
+    aux: State,
+    sys: System,
 ) -> eqx.Module:
-    H = sys.get_H(q_star, model, aux)
+    H = sys.get_H(_lambda, q_star, model, aux)
     H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
     v = jnp.linalg.solve(H_reg, grad_obj)
-    _, vjp_fn = jax.vjp(lambda _m: sys.get_F(q_star, _m, aux), model)
-    (grads,) = vjp_fn(v)
+    _, vjp_fn = jax.vjp(lambda _m: sys.get_F(_lambda, q_star, _m, aux), model)
+    (grads,) = vjp_fn(-v)
     return grads
 
 
@@ -35,14 +40,14 @@ def solve_step(
         q, e_old, res = carry
 
         # TODO: use SOCU for blockdiagonal
-        H = sys.get_H(q, model, aux)
+        H = sys.get_H(_lambda, q, model, aux)
         H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
         delta_q = jnp.linalg.solve(H_reg, res)
-        slope = -jnp.dot(res, delta_q)
+        slope = jnp.dot(res, delta_q)
 
         # Parallel line search
         test_qs = q + alphas[:, None] * delta_q
-        test_energies = jax.vmap(lambda _q: sys.get_E(_q, model, aux))(test_qs)
+        test_energies = jax.vmap(lambda _q: sys.get_E(_lambda, _q, model, aux))(test_qs)
 
         # If Armijo fails, take the smallest possible step
         is_good = test_energies <= e_old + c1 * alphas * slope  # Armijo Condition
@@ -50,14 +55,14 @@ def solve_step(
 
         next_q = test_qs[safe_idx]
         next_e = test_energies[safe_idx]
-        next_res = sys.get_F(next_q, model, aux)
+        next_res = -sys.get_F(_lambda, next_q, model, aux)
 
         return (next_q, next_e, next_res), jnp.linalg.norm(next_res)
 
     q_init = sys.get_q(_lambda, q0)
-    init_e = sys.get_E(q_init, model, aux)
-    init_res = sys.get_F(q_init, model, aux)
-    (final_q, _, _), _ = jax.lax.scan(
+    init_e = sys.get_E(_lambda, q_init, model, aux)
+    init_res = -sys.get_F(_lambda, q_init, model, aux)
+    (final_q, _, final_res), _ = jax.lax.scan(
         newton_step, (q_init, init_e, init_res), None, iters
     )
     return final_q
@@ -93,7 +98,7 @@ def solve_step_bwd(
     ls_steps: int = 10,
     c1: float = 1e-4,
 ) -> eqx.Module:
-    return compute_ift_gradient(res, grad_obj, model, aux, sys)
+    return compute_ift_gradient(_lambda, res, grad_obj, model, aux, sys)
 
 
 @eqx.filter_custom_vjp
@@ -120,7 +125,7 @@ def solve(
             q, aux, curr_L = carry
             next_L = jnp.minimum(curr_L + max_dt, target_lambda)
             new_q = solve_step(model, next_L, q, aux, sys, iters, ls_steps, c1)
-            new_aux = jax.vmap(lambda a: a.update(new_q))(aux)
+            new_aux = jax.vmap(lambda a: a.update(new_q))(aux) if aux else aux
             return new_q, new_aux, next_L
 
         final_q, final_aux, final_L = jax.lax.while_loop(
@@ -128,9 +133,7 @@ def solve(
         )
         return (final_q, final_aux, final_L), final_q
 
-    _, qs = jax.lax.scan(
-        scan_fn, (q0, aux, jnp.asarray(lambdas[0], dtype=lambdas.dtype)), lambdas
-    )
+    _, qs = jax.lax.scan(scan_fn, (q0, aux, lambdas[0]), lambdas)
     return qs
 
 
@@ -159,7 +162,7 @@ def solve_fwd(
             next_L = jnp.minimum(curr_L + max_dt, target_lambda)
 
             new_q = solve_step(model, next_L, q, aux, sys, iters, ls_steps, c1)
-            new_aux = jax.vmap(lambda a: a.update(new_q))(aux)
+            new_aux = jax.vmap(lambda a: a.update(new_q))(aux) if aux else aux
 
             return new_q, new_aux, next_L
 
@@ -190,7 +193,7 @@ def solve_bwd(
     max_dt: float = 1e9,
 ) -> eqx.Module:
     qs, auxs = res
-    batched_ift_fn = jax.vmap(compute_ift_gradient, in_axes=(0, 0, None, 0, None))
-    batched_grads = batched_ift_fn(qs, grad_obj, model, auxs, sys)
+    batched_ift_fn = jax.vmap(compute_ift_gradient, in_axes=(0, 0, 0, None, 0, None))
+    batched_grads = batched_ift_fn(lambdas, qs, grad_obj, model, auxs, sys)
     total_grad = jax.tree.map(lambda x: jnp.sum(x, axis=0), batched_grads)
     return total_grad

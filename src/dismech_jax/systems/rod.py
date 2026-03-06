@@ -24,6 +24,7 @@ class Rod(System[TripletState]):
     triplets: Triplet
     F_ext: jax.Array
     bc: BC
+    q0: jax.Array
 
     @classmethod
     def from_geometry(
@@ -34,7 +35,7 @@ class Rod(System[TripletState]):
         bc: BC = BC(jnp.empty(0), jnp.empty(0), jnp.empty(0)),
         origin: jax.Array = jnp.array([0.0, 0.0, 0.0]),
         gravity: float = -9.81,
-    ) -> tuple[Rod, jax.Array, TripletState]:
+    ) -> tuple[Rod, TripletState]:
         if N < 3:
             raise ValueError("Cannot create a rod with less than 3 nodes.")
         if geom.length < 1e-6:
@@ -71,8 +72,9 @@ class Rod(System[TripletState]):
             triplets=triplets,
             F_ext=F_ext,
             bc=BC(jnp.empty(0), jnp.empty(0), jnp.empty(0)),
+            q0=q0,
         )
-        return rod, q0, batch_aux
+        return rod, batch_aux
 
     def with_bc(self, bc: BC) -> Rod:
         return eqx.tree_at(lambda r: r.bc, self, bc)
@@ -80,25 +82,32 @@ class Rod(System[TripletState]):
     def get_DER(self, geom: Geometry, material: Material) -> DER:
         return DER.from_legacy(self.triplets.l_k[0, 0], geom, material)
 
-    def get_E(self, q: jax.Array, model: eqx.Module, aux: TripletState) -> jax.Array:
+    def get_E(
+        self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
+    ) -> jax.Array:
         batch_qs = self.global_q_to_batch_q(q)
-        return jnp.sum(
+        E_int = jnp.sum(
             jax.vmap(lambda t, q_loc, _aux: t.get_energy(q_loc, model, _aux))(
                 self.triplets, batch_qs, aux
             )
         )
+        E_ext = -jnp.sum(self.F_ext * q)
+        return E_int + E_ext
 
     def get_q(self, _lambda: jax.Array, q0: jax.Array) -> jax.Array:
         return q0.at[self.bc.idx_b].set(self.bc.xb_m * _lambda + self.bc.xb_c)
 
-    def get_F(self, q: jax.Array, model: eqx.Module, aux: TripletState) -> jax.Array:
+    def get_F(
+        self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
+    ) -> jax.Array:
         mask = jnp.ones_like(q).at[self.bc.idx_b].set(0.0)
-        F_int = jax.grad(self.get_E, 0)(q, model, aux)
-        return mask * (self.F_ext - F_int)
+        return mask * jax.grad(self.get_E, 1)(_lambda, q, model, aux)
 
-    def get_H(self, q: jax.Array, model: eqx.Module, aux: TripletState) -> jax.Array:
+    def get_H(
+        self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
+    ) -> jax.Array:
         mask = jnp.ones_like(q).at[self.bc.idx_b].set(0.0)
-        H = jax.hessian(self.get_E, 0)(q, model, aux)
+        H = jax.hessian(self.get_E, 1)(_lambda, q, model, aux)
         H = H * mask[:, None] * mask[None, :]
         diag_idx = jnp.arange(H.shape[0])
         return H.at[diag_idx, diag_idx].add(1.0 - mask)
@@ -134,28 +143,26 @@ class Rod(System[TripletState]):
     @staticmethod
     def _get_batched_axes() -> Rod:
         bc_spec = BC(idx_b=None, xb_c=None, xb_m=0)  # type: ignore
-        return Rod(triplets=None, F_ext=None, bc=bc_spec)  # type: ignore
+        return Rod(triplets=None, F_ext=None, bc=bc_spec, q0=None)  # type: ignore
 
     @eqx.filter_jit
     def solve(
         self,
         model: eqx.Module,
         lambdas: jax.Array,
-        q0: jax.Array,
         aux: TripletState,
         iters: int = 10,
         ls_steps: int = 10,
         c1: float = 1e-4,
         max_dt: float = 1e-1,
     ) -> jax.Array:
-        return solve(model, lambdas, q0, aux, self, iters, ls_steps, c1, max_dt)
+        return solve(model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dt)
 
     @eqx.filter_jit
     def batch_solve(
         self,
         model: eqx.Module,
         lambdas: jax.Array,
-        q0: jax.Array,
         aux: TripletState,
         iters: int = 10,
         ls_steps: int = 10,
@@ -166,7 +173,7 @@ class Rod(System[TripletState]):
         v_solve = eqx.filter_vmap(
             solve, in_axes=(None, None, None, None, rod_axes, None, None, None, None)
         )
-        return v_solve(model, lambdas, q0, aux, self, iters, ls_steps, c1, max_dt)
+        return v_solve(model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dt)
 
     @eqx.filter_jit
     def batch_F(
