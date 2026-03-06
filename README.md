@@ -8,4 +8,4 @@ uv sync
 ```
 
 > [!TIP]
-> If your system has [JAX-compatible hardware acceleration]([https://docs.jax.dev/en/latest/installation.html](https://docs.jax.dev/en/latest/installation.html#supported-platforms)), use the extra dependencies `--extra cuda` or `--extra tpu`.
+> If your system has [JAX-compatible hardware acceleration](https://docs.jax.dev/en/latest/installation.html#supported-platforms), use the extra dependencies `--extra cuda` or `--extra tpu`.
