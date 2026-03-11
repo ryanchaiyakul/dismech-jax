@@ -65,6 +65,7 @@ def solve_step(
     (final_q, _, final_res), _ = jax.lax.scan(
         newton_step, (q_init, init_e, init_res), None, iters
     )
+    # jax.debug.print("{}", jnp.linalg.norm(final_res))
     return final_q
 
 
@@ -133,7 +134,10 @@ def solve(
         )
         return (final_q, final_aux, final_L), final_q
 
-    _, qs = jax.lax.scan(scan_fn, (q0, aux, lambdas[0]), lambdas)
+    # jax.lax.while_loop is not a do while
+    q_start = solve_step(model, lambdas[0], q0, aux, sys, iters, ls_steps, c1)
+    aux_start = jax.vmap(lambda a: a.update(q_start))(aux) if aux else aux
+    _, qs = jax.lax.scan(scan_fn, (q_start, aux_start, lambdas[0]), lambdas)
     return qs
 
 

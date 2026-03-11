@@ -66,7 +66,6 @@ class Rod(System[TripletState]):
         triplets = jax.vmap(lambda q, a, l_k: Triplet.init(q, a, l_k=l_k))(
             batch_q, batch_aux, batch_l_ks
         )
-
         F_ext = jnp.zeros_like(q0).at[2::4].set(mass[2::4] * gravity)
         rod = Rod(
             triplets=triplets,
@@ -126,18 +125,19 @@ class Rod(System[TripletState]):
 
         # Node contributions
         weights = 0.5 * l_ks[0]
-        v_ref_len = jnp.ones(N) * weights
-        v_ref_len = v_ref_len.at[0].add(weights)
-        v_ref_len = v_ref_len.at[-1].add(weights)
+        v_ref_len = jnp.ones(N) * 2 * weights
+        v_ref_len = v_ref_len.at[0].set(weights)
+        v_ref_len = v_ref_len.at[-1].set(weights)
         dm_nodes = v_ref_len * A * material.density
-        node_dofs = jnp.arange(3 * N).reshape(-1, 3)
-        mass = mass.at[node_dofs].add(dm_nodes[:, None])
+        node_start_indices = jnp.arange(N) * 4
+        for i in range(3):  # Fill x, y, and z
+            mass = mass.at[node_start_indices + i].set(dm_nodes)
 
         # Edge contributions (moment of inertia)
         factor = geom.jxs / geom.axs if geom.jxs and geom.axs else geom.r0**2 / 2
-        edge_mass = l_ks * A * material.density * factor
-        edge_dofs = 3 * N + jnp.arange(N - 1)
-        mass = mass.at[edge_dofs].set(edge_mass)
+        dm_edges = l_ks * A * material.density * factor
+        edge_indices = jnp.arange(N - 1) * 4 + 3
+        mass = mass.at[edge_indices].set(dm_edges)
         return mass
 
     @staticmethod
