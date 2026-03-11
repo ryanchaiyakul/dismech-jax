@@ -63,11 +63,7 @@ def validate_model(cls: type) -> None:
         )
 
 
-def train_model(cls: type, key: jax.Array = jax.random.PRNGKey(42)) -> None:
-    train = TestCase.from_npz("train.npz")
-    valid = TestCase.from_npz("valid.npz")
-
-    lambdas = jnp.linspace(0.0, 1.0, 11)
+def get_base_rod():
     geom = dismech_jax.Geometry(0.2, 5e-3)
     mat = dismech_jax.Material(1273.52, 1e7)
     temp, aux = dismech_jax.Rod.from_geometry(geom, mat, N=3)
@@ -90,9 +86,23 @@ def train_model(cls: type, key: jax.Array = jax.random.PRNGKey(42)) -> None:
         ]
     )
     base = eqx.tree_at(lambda r: r.F_ext, temp, F_new)
+    der = base.get_DER(geom, mat)
+    return base, aux, der
 
+
+def train_model(cls: type, key: jax.Array = jax.random.PRNGKey(42)) -> None:
+    base, aux, der = get_base_rod()
+
+    # Load from binary
+    train = TestCase.from_npz("train.npz")
+    valid = TestCase.from_npz("valid.npz")
+
+    # Partially batched BCs
     train_rods = base.with_bc(train.bc)
     valid_rods = base.with_bc(valid.bc)
+
+    train_lambdas = jnp.linspace(0.0, 1.0, train.qs.shape[1])
+    valid_lambdas = jnp.linspace(0.0, 1.0, valid.qs.shape[1])
 
     # TODO: more principled init
     model = cls(der_K=jnp.array([2.0, 2.0, 0.02, 0.02, 0.01]), key=key)
@@ -100,11 +110,15 @@ def train_model(cls: type, key: jax.Array = jax.random.PRNGKey(42)) -> None:
     opt_state = optimizer.init(model)
 
     def loss(model: eqx.Module, rods: dismech_jax.Rod, truth: jax.Array):
-        pred = rods.batch_solve(model, lambdas, aux, max_dt=5e-3, iters=5, ls_steps=10)
+        pred = rods.batch_solve(
+            model, train_lambdas, aux, max_dt=5e-3, iters=5, ls_steps=10
+        )
         return jnp.mean(jnp.square(pred - truth))
 
     def eval_loss(model: eqx.Module, rods: dismech_jax.Rod, truth: jax.Array):
-        pred = rods.batch_solve(model, lambdas, aux, max_dt=5e-3, iters=5, ls_steps=10)
+        pred = rods.batch_solve(
+            model, valid_lambdas, aux, max_dt=5e-3, iters=5, ls_steps=10
+        )
         return jnp.mean(jnp.square(pred - truth))
 
     @eqx.filter_jit
