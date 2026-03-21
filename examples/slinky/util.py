@@ -15,16 +15,18 @@ import dismech_jax
 
 
 class TestCase(eqx.Module):
-    bc: dismech_jax.BC
+    bc: dismech_jax.BatchedLinearBC
     qs: jax.Array
 
     @classmethod
     def from_npz(cls, filename: str) -> TestCase:
         data = jnp.load(filename)
-        loaded_bc = dismech_jax.BC(
+        loaded_bc = dismech_jax.BatchedLinearBC(
             idx_b=data["idx_b"], xb_c=data["xb_c"], xb_m=data["xb_m"]
         )
         return cls(bc=loaded_bc, qs=data["qs"])
+
+    # TODO: create a TestCase npz?
 
 
 class TripletModel(eqx.Module):
@@ -85,7 +87,8 @@ def get_base_rod():
             MASS / 4 * -9.81,
         ]
     )
-    base = eqx.tree_at(lambda r: r.F_ext, temp, F_new)
+
+    base = eqx.tree_at(lambda r: r.E_ext, temp, dismech_jax.Gravity(F_new))
     der = base.get_DER(geom, mat)
     return base, aux, der
 
@@ -110,14 +113,14 @@ def train_model(cls: type, key: jax.Array = jax.random.PRNGKey(42)) -> None:
     opt_state = optimizer.init(model)
 
     def loss(model: eqx.Module, rods: dismech_jax.Rod, truth: jax.Array):
-        pred = rods.batch_solve(
-            model, train_lambdas, aux, max_dt=5e-3, iters=5, ls_steps=10
+        pred = rods.solve(
+            model, train_lambdas, aux, max_dlambda=5e-3, iters=5, ls_steps=10
         )
         return jnp.mean(jnp.square(pred - truth))
 
     def eval_loss(model: eqx.Module, rods: dismech_jax.Rod, truth: jax.Array):
-        pred = rods.batch_solve(
-            model, valid_lambdas, aux, max_dt=5e-3, iters=5, ls_steps=10
+        pred = rods.solve(
+            model, valid_lambdas, aux, max_dlambda=5e-3, iters=5, ls_steps=10
         )
         return jnp.mean(jnp.square(pred - truth))
 
@@ -152,7 +155,7 @@ def train_model(cls: type, key: jax.Array = jax.random.PRNGKey(42)) -> None:
         )
         return final_model, final_state, train_history, valid_history
 
-    model, opt_state, train_history, valid_history = run_training(model, opt_state, 201)
+    model, opt_state, train_history, valid_history = run_training(model, opt_state, 101)
 
     return model
 

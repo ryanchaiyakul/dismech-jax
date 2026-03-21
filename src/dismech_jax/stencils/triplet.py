@@ -6,12 +6,13 @@ from ..states import TripletState
 from ..util import material_frame
 
 
-class Triplet(Stencil):
+class Triplet(Stencil[TripletState]):
     """Discrete diferential geometry strain triplet."""
 
     l_k: jax.Array  # [l_ke, l_kf]
 
-    def get_strain(self, q: jax.Array, aux: TripletState | None = None) -> jax.Array:
+    def get_strain(self, q: jax.Array, aux: TripletState) -> jax.Array:
+        assert type(aux) is TripletState
         te_old, tf_old = aux.t
         d1e, d1f = aux.d1
         beta = aux.beta

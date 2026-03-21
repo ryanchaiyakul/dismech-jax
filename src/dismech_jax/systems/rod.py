@@ -3,28 +3,25 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import equinox as eqx
+import diffrax
+
+from .bc import AbstractBC
+from .energy import AbstractEnergy, Gravity
 
 from ..models import DER
-from ..stencils import Triplet
+from ..stencils import Triplet, Triplet2D
 from ..states import TripletState
 from ..params import Geometry, Material
 from .system import System
 from ..solver import solve
 
 
-class BC(eqx.Module):
-    """Linear boundary condition."""
-
-    idx_b: jax.Array
-    xb_m: jax.Array
-    xb_c: jax.Array
-
-
 class Rod(System[TripletState]):
     triplets: Triplet
-    F_ext: jax.Array
-    bc: BC
+    mass: jax.Array
     q0: jax.Array
+    E_ext: AbstractEnergy
+    bc: AbstractBC
 
     @classmethod
     def from_geometry(
@@ -32,10 +29,11 @@ class Rod(System[TripletState]):
         geom: Geometry,
         material: Material,
         N: int = 30,
-        bc: BC = BC(jnp.empty(0), jnp.empty(0), jnp.empty(0)),
+        bc: AbstractBC = AbstractBC(),
         origin: jax.Array = jnp.array([0.0, 0.0, 0.0]),
         gravity: float = -9.81,
-    ) -> tuple[Rod, TripletState]:
+        is_2d: bool = False,
+    ) -> tuple[Rod, TripletState | None]:
         if N < 3:
             raise ValueError("Cannot create a rod with less than 3 nodes.")
         if geom.length < 1e-6:
@@ -46,79 +44,213 @@ class Rod(System[TripletState]):
         q0 = q0.at[0::4].set(xs)
         q0 = q0.at[1::4].set(origin[1])
         q0 = q0.at[2::4].set(origin[2])
-        batch_q = Rod.global_q_to_batch_q(q0)
+        batch_q = Rod._global_q_to_batch_q(q0)
 
         l_ks = jnp.diff(xs)
-        mass = Rod.get_mass(geom, material, l_ks)
+        mass = Rod._get_mass(geom, material, l_ks)
 
         N_triplets = batch_q.shape[0]
         batch_l_ks = jax.vmap(lambda i: jax.lax.dynamic_slice(l_ks, (i,), (2,)))(
             jnp.arange(N_triplets)
         )
 
-        t_pair = jnp.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-        d1_pair = jnp.array([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
-        ts = jnp.broadcast_to(t_pair, (N_triplets, 2, 3))
-        d1s = jnp.broadcast_to(d1_pair, (N_triplets, 2, 3))
-        betas = jnp.zeros(N_triplets)
+        if is_2d:
+            batch_aux = None
+            triplets = jax.vmap(lambda q, l_k: Triplet2D.init(q, None, l_k=l_k))(
+                batch_q, batch_l_ks
+            )
+        else:
+            t_pair = jnp.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+            d1_pair = jnp.array([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+            ts = jnp.broadcast_to(t_pair, (N_triplets, 2, 3))
+            d1s = jnp.broadcast_to(d1_pair, (N_triplets, 2, 3))
+            betas = jnp.zeros(N_triplets)
 
-        batch_aux = jax.vmap(TripletState)(ts, d1s, betas)
-        triplets = jax.vmap(lambda q, a, l_k: Triplet.init(q, a, l_k=l_k))(
-            batch_q, batch_aux, batch_l_ks
-        )
+            batch_aux = jax.vmap(TripletState)(ts, d1s, betas)
+            triplets = jax.vmap(lambda q, a, l_k: Triplet.init(q, a, l_k=l_k))(
+                batch_q, batch_aux, batch_l_ks
+            )
+
         F_ext = jnp.zeros_like(q0).at[2::4].set(mass[2::4] * gravity)
+
         rod = Rod(
             triplets=triplets,
-            F_ext=F_ext,
-            bc=BC(jnp.empty(0), jnp.empty(0), jnp.empty(0)),
+            E_ext=Gravity(F_ext),
+            bc=bc,
             q0=q0,
+            mass=mass,
         )
         return rod, batch_aux
 
-    def with_bc(self, bc: BC) -> Rod:
+    def with_bc(self, bc: AbstractBC) -> Rod:
+        """Get a new Rod PyTree with `self.bc` replaced with passed `bc`.
+
+        Args:
+            bc (AbstractBC): Subclassed boundary condition object.
+
+        Returns:
+            Rod: rod object.
+        """
         return eqx.tree_at(lambda r: r.bc, self, bc)
 
     def get_DER(self, geom: Geometry, material: Material) -> DER:
+        """Get a DER energy model for `self.solve(model, ...)`.
+
+        Args:
+            geom (Geometry): Geometry object.
+            material (Material): Material object.
+
+        Returns:
+            DER: Energy model.
+        """
+        # Assumes nodes are evenly spaced
         return DER.from_legacy(self.triplets.l_k[0, 0], geom, material)
+
+    def get_q(self, _lambda: jax.Array, q0: jax.Array) -> jax.Array:
+        """Get `q0` with applied with boundary condition at `_lambda`.
+
+        Args:
+            _lambda (jax.Array): Lambda.
+            q0 (jax.Array): Initial state.
+
+        Returns:
+            jax.Array: State with applied boundary condition.
+        """
+        return self.bc.apply(q0, _lambda)
 
     def get_E(
         self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
     ) -> jax.Array:
-        batch_qs = self.global_q_to_batch_q(q)
+        """Get scalar energy of state `q` at `_lambda` after applied boundary condition.
+
+        Args:
+            _lambda (jax.Array): Lambda.
+            q (jax.Array): Initial state.
+            model (eqx.Module): Energy model.
+            aux (TripletState): Triplet director object.
+
+        Returns:
+            jax.Array: Scalar energy.
+        """
+        batch_qs = self._global_q_to_batch_q(q)
         E_int = jnp.sum(
             jax.vmap(lambda t, q_loc, _aux: t.get_energy(q_loc, model, _aux))(
                 self.triplets, batch_qs, aux
             )
         )
-        E_ext = -jnp.sum(self.F_ext * q)
-        return E_int + E_ext
-
-    def get_q(self, _lambda: jax.Array, q0: jax.Array) -> jax.Array:
-        return q0.at[self.bc.idx_b].set(self.bc.xb_m * _lambda + self.bc.xb_c)
+        return E_int + self.E_ext(q, _lambda)
 
     def get_F(
         self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
     ) -> jax.Array:
-        mask = jnp.ones_like(q).at[self.bc.idx_b].set(0.0)
+        """Get vector force of state `q` at `_lambda` after applied boundary condition.
+
+        Args:
+            _lambda (jax.Array): Lambda.
+            q (jax.Array): Initial state.
+            model (eqx.Module): Energy model.
+            aux (TripletState): Triplet director object.
+
+        Returns:
+            jax.Array: Vector force.
+        """
+        mask = self.bc.mask(q)
         return mask * jax.grad(self.get_E, 1)(_lambda, q, model, aux)
 
     def get_H(
         self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
     ) -> jax.Array:
-        mask = jnp.ones_like(q).at[self.bc.idx_b].set(0.0)
+        """Get square Hessian of state `q` at `_lambda` after applied boundary condition.
+
+        Args:
+            _lambda (jax.Array): Lambda.
+            q (jax.Array): Initial state.
+            model (eqx.Module): Energy model.
+            aux (TripletState): Triplet director object.
+
+        Returns:
+            jax.Array: square Hessian.
+        """
+        mask = self.bc.mask(q)
         H = jax.hessian(self.get_E, 1)(_lambda, q, model, aux)
         H = H * mask[:, None] * mask[None, :]
         diag_idx = jnp.arange(H.shape[0])
         return H.at[diag_idx, diag_idx].add(1.0 - mask)
 
+    def get_ode_term(self) -> diffrax.ODETerm:
+        """Get `diffrax.ODETerm` to solve a ODE.
+
+        Returns:
+            diffrax.ODETerm: ODETerm object.
+        """
+
+        if self.is_batched(self.in_axes):
+            raise NotImplementedError(
+                f"get_ode_term: {self} contains a batched BC or E_ext. This is not supported yet!"
+            )
+
+        @eqx.filter_jit
+        def rhs(_lambda, y, args):
+            model, aux = args
+            _lambda = jnp.asarray(_lambda)
+
+            # split [q, v]
+            n_dofs = self.q0.shape[0]
+            q, v = y[:n_dofs], y[n_dofs:]
+
+            # Get fixed DOF
+            q_fixed, v_fixed = jax.jvp(
+                lambda l: self.bc.apply(q, l), (_lambda,), (jnp.ones_like(_lambda),)
+            )
+
+            # update [q, v]
+            v = v * self.bc.mask(q) + v_fixed * (1.0 - self.bc.mask(q))
+            a = -self.get_F(_lambda, q_fixed, model, aux) / self.mass
+            return jnp.concatenate([v, a])
+
+        return diffrax.ODETerm(rhs)
+
+    @eqx.filter_jit
+    def solve(
+        self,
+        model: eqx.Module,
+        lambdas: jax.Array,
+        aux: TripletState,
+        iters: int = 10,
+        ls_steps: int = 10,
+        c1: float = 1e-4,
+        max_dlambda: float = 1e-1,
+    ) -> jax.Array:
+        """Helper solve function which batches BC and external energy if necessary.
+
+        Args:
+            model (eqx.Module): energy model.
+            lambdas (jax.Array): lambdas `(N,)`.
+            aux (TripletState): Initial triplet state.
+            iters (int, optional): Number of newton-raphson iterations. Defaults to 10.
+            ls_steps (int, optional): Number of alphas evaluated. Defaults to 10.
+            c1 (float, optional): Armijo coefficient. Defaults to 1e-4.
+            max_dlambda (float, optional): Maximum lambda step size. Defaults to 1e-1.
+
+        Returns:
+            jax.Array: Solved state `(N, # of DOFs)` or `(B, N, # of DOFs)`.
+        """
+        args = (model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dlambda)
+        if not self.is_batched(self.in_axes):
+            return solve(*args)
+        return eqx.filter_vmap(
+            solve,
+            in_axes=(None, None, None, None, self.in_axes, None, None, None, None),
+        )(*args)
+
     @staticmethod
-    def global_q_to_batch_q(q: jax.Array) -> jax.Array:
+    def _global_q_to_batch_q(q: jax.Array) -> jax.Array:
         N_triplets = (q.shape[0] + 1) // 4 - 2
         starts = jnp.arange(N_triplets) * 4
         return jax.vmap(lambda s: jax.lax.dynamic_slice(q, (s,), (11,)))(starts)
 
     @staticmethod
-    def get_mass(geom: Geometry, material: Material, l_ks: jax.Array) -> jax.Array:
+    def _get_mass(geom: Geometry, material: Material, l_ks: jax.Array) -> jax.Array:
         N = l_ks.shape[0] + 1  # Number of nodes
         mass = jnp.zeros(N * 4 - 1)
         A = geom.axs if geom.axs else jnp.pi * geom.r0**2
@@ -140,55 +272,18 @@ class Rod(System[TripletState]):
         mass = mass.at[edge_indices].set(dm_edges)
         return mass
 
+    @property
+    def in_axes(self) -> Rod:
+        return Rod(
+            triplets=None,  # type: ignore
+            mass=None,  # type: ignore
+            q0=None,  # type: ignore
+            E_ext=self.E_ext.in_axes,  # type: ignore
+            bc=self.bc.in_axes,  # type: ignore
+        )
+
     @staticmethod
-    def _get_batched_axes() -> Rod:
-        bc_spec = BC(idx_b=None, xb_c=None, xb_m=0)  # type: ignore
-        return Rod(triplets=None, F_ext=None, bc=bc_spec, q0=None)  # type: ignore
-
-    @eqx.filter_jit
-    def solve(
-        self,
-        model: eqx.Module,
-        lambdas: jax.Array,
-        aux: TripletState,
-        iters: int = 10,
-        ls_steps: int = 10,
-        c1: float = 1e-4,
-        max_dt: float = 1e-1,
-    ) -> jax.Array:
-        return solve(model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dt)
-
-    @eqx.filter_jit
-    def batch_solve(
-        self,
-        model: eqx.Module,
-        lambdas: jax.Array,
-        aux: TripletState,
-        iters: int = 10,
-        ls_steps: int = 10,
-        c1: float = 1e-4,
-        max_dt: float = 1e-1,
-    ) -> jax.Array:
-        rod_axes = self._get_batched_axes()
-        v_solve = eqx.filter_vmap(
-            solve, in_axes=(None, None, None, None, rod_axes, None, None, None, None)
-        )
-        return v_solve(model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dt)
-
-    @eqx.filter_jit
-    def batch_F(
-        self,
-        qs: jax.Array,
-        model: eqx.Module,
-        aux: TripletState,
-    ) -> jax.Array:
-        rod_axes = self._get_batched_axes()
-
-        def fn(r, qs_per_rod):
-            return jax.vmap(lambda _q: r.get_F(_q, model, aux))(qs_per_rod)
-
-        v_F = eqx.filter_vmap(
-            lambda r, _q,: fn(r, _q),
-            in_axes=(rod_axes, 0),
-        )
-        return v_F(self, qs)
+    def is_batched(axes) -> bool:
+        """Returns True if any leaf in the PyTree is not None."""
+        leaves = jax.tree_util.tree_leaves(axes)
+        return any(leaf is not None for leaf in leaves)
