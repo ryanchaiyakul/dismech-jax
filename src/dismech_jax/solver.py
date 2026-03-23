@@ -164,10 +164,8 @@ def solve_fwd(
         def body_fn(val):
             q, aux, curr_L = val
             next_L = jnp.minimum(curr_L + max_dt, target_lambda)
-
             new_q = solve_step(model, next_L, q, aux, sys, iters, ls_steps, c1)
             new_aux = jax.vmap(lambda a: a.update(new_q))(aux) if aux else aux
-
             return new_q, new_aux, next_L
 
         final_q, final_aux, final_L = jax.lax.while_loop(
@@ -175,8 +173,12 @@ def solve_fwd(
         )
         return (final_q, final_aux, final_L), (final_q, _aux)
 
+    # Match solve() exactly: compute q_start first
+    q_start = solve_step(model, lambdas[0], q0, aux, sys, iters, ls_steps, c1)
+    aux_start = jax.vmap(lambda a: a.update(q_start))(aux) if aux else aux
+
     _, (qs, auxs) = jax.lax.scan(
-        scan_fwd_fn, (q0, aux, jnp.asarray(lambdas[0], dtype=lambdas.dtype)), lambdas
+        scan_fwd_fn, (q_start, aux_start, lambdas[0]), lambdas
     )
     return qs, (qs, auxs)
 
@@ -194,7 +196,7 @@ def solve_bwd(
     iters: int = 10,
     ls_steps: int = 10,
     c1: float = 1e-4,
-    max_dt: float = 1e9,
+    max_dt: float = 1e-1,
 ) -> eqx.Module:
     qs, auxs = res
     batched_ift_fn = jax.vmap(compute_ift_gradient, in_axes=(0, 0, 0, None, 0, None))
