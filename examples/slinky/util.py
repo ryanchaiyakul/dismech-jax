@@ -76,15 +76,15 @@ def get_base_rod():
         [
             0.0,
             0.0,
-            MASS / 3 * -9.81,
+            MASS / 4 * -9.81,
             0.0,
             0.0,
             0.0,
-            MASS / 3 * -9.81,
+            MASS / 2 * -9.81,
             0.0,
             0.0,
             0.0,
-            MASS / 3 * -9.81,
+            MASS / 4 * -9.81,
         ]
     )
 
@@ -100,6 +100,7 @@ def train_model(
     valid_file: str = "valid.npz",
     n_epochs: int = 100,
     lr: float = 1e-2,
+    init_K = jnp.array([2.0, 0.01]), # stretching and bending stiffness initial values, can be overridden by user input
 ) -> tuple:
     base, aux, der = get_base_rod()
 
@@ -114,7 +115,8 @@ def train_model(
     train_lambdas = jnp.linspace(0.0, 1.0, train.qs.shape[0])
     valid_lambdas = jnp.linspace(0.0, 1.0, valid.qs.shape[0])
 
-    model = cls(der_K=jnp.array([2.0, 2.0, 0.02, 0.02, 0.01]), key=key)
+    model = cls(der_K=init_K, key=key)
+    init_K = model.K
     ####################
     # Cosine decay schedule
     schedule = optax.cosine_decay_schedule(
@@ -154,13 +156,14 @@ def train_model(
             current_lr = schedule(step_idx)
 
             jax.debug.callback(
-                lambda s, lr_now, t, v: print(
-                    f"Step {s:<4} | LR: {lr_now:<10.3e} | Train: {t:<12.5e} | Valid: {v:<12.5e}"
+                lambda s, lr_now, t, v, K: print(
+                    f"Step {s:<4} | LR: {lr_now:<10.3e} | Train: {t:<12.5e} | Valid: {v:<12.5e} | K: {K}"
                 ) if v != -1.0 else None,
                 step_idx,
                 current_lr,
                 loss_val,
                 valid_loss,
+                next_m.K, # print learned stiffnesses at each step
             )
 
             return (next_m, next_s), (loss_val, valid_loss)
@@ -174,4 +177,4 @@ def train_model(
         model, opt_state, n_epochs + 1
     )
 
-    return model, train_history, valid_history
+    return model, init_K, train_history, valid_history
