@@ -9,7 +9,6 @@ import optax
 
 from jaxtyping import Float, jaxtyped, TypeCheckError
 from beartype import beartype
-import plotly.graph_objects as go
 
 import dismech_jax
 
@@ -71,20 +70,21 @@ def get_base_rod():
     temp, aux = dismech_jax.Rod.from_geometry(geom, mat, N=3)
 
     # Replace F_ext i.e. gravity with full slinky
-    MASS = 0.0907407814  # From dismech-python
+    # MASS = 0.647  # From dismech-python
+    MASS = 0.09
     F_new = jnp.array(
         [
             0.0,
             0.0,
-            MASS / 4 * -9.81,
+            MASS / 3 * -9.81,
             0.0,
             0.0,
             0.0,
-            MASS / 2 * -9.81,
+            MASS / 3 * -9.81,
             0.0,
             0.0,
             0.0,
-            MASS / 4 * -9.81,
+            MASS / 3 * -9.81,
         ]
     )
 
@@ -93,36 +93,44 @@ def get_base_rod():
     return base, aux, der
 
 
-def train_model(cls: type, key: jax.Array = jax.random.PRNGKey(42)) -> None:
+#  train and validation datafiles are now input, n_epochs is input, train and validation loss history is output
+def train_model(cls: type, key: jax.Array = jax.random.PRNGKey(42), train_file: str = "train.npz", valid_file: str = "valid.npz", n_epochs: int = 100, lr: float = 1e-2) -> tuple:
     base, aux, der = get_base_rod()
 
     # Load from binary
-    train = TestCase.from_npz("train.npz")
-    valid = TestCase.from_npz("valid.npz")
+    train = TestCase.from_npz(train_file)
+    valid = TestCase.from_npz(valid_file)
 
     # Partially batched BCs
     train_rods = base.with_bc(train.bc)
     valid_rods = base.with_bc(valid.bc)
 
-    train_lambdas = jnp.linspace(0.0, 1.0, train.qs.shape[1])
-    valid_lambdas = jnp.linspace(0.0, 1.0, valid.qs.shape[1])
+    print("train.qs shape: ", train.qs.shape)
+    print("valid.qs shape: ", valid.qs.shape)
+
+    train_lambdas = jnp.linspace(0.0, 1.0, train.qs.shape[0])
+    valid_lambdas = jnp.linspace(0.0, 1.0, valid.qs.shape[0])
 
     # TODO: more principled init
     model = cls(der_K=jnp.array([2.0, 2.0, 0.02, 0.02, 0.01]), key=key)
-    optimizer = optax.adam(1e-2)
+    optimizer = optax.adam(lr)
     opt_state = optimizer.init(model)
 
     def loss(model: eqx.Module, rods: dismech_jax.Rod, truth: jax.Array):
         pred = rods.solve(
             model, train_lambdas, aux, max_dlambda=5e-3, iters=5, ls_steps=10
         )
-        return jnp.mean(jnp.square(pred - truth))
+        diff = pred - truth
+        # only use difference in free dofs, ie. dofs except idx_b
+        # pred = pred.at[train.bc.idx_b].set(0.0)
+        return jnp.mean(jnp.square(diff[:, :]))
 
     def eval_loss(model: eqx.Module, rods: dismech_jax.Rod, truth: jax.Array):
         pred = rods.solve(
             model, valid_lambdas, aux, max_dlambda=5e-3, iters=5, ls_steps=10
         )
-        return jnp.mean(jnp.square(pred - truth))
+        diff = pred - truth
+        return jnp.mean(jnp.square(diff[:,:]))
 
     @eqx.filter_jit
     def run_training(model, opt_state, num_steps: int, val_interval: int = 10):
@@ -155,106 +163,6 @@ def train_model(cls: type, key: jax.Array = jax.random.PRNGKey(42)) -> None:
         )
         return final_model, final_state, train_history, valid_history
 
-    model, opt_state, train_history, valid_history = run_training(model, opt_state, 101)
+    model, opt_state, train_history, valid_history = run_training(model, opt_state, n_epochs+1)
 
-    return model
-
-
-def animate(qs):
-    frames = []
-    all_coords = np.vstack([qs[:, 0:3], qs[:, 4:7], qs[:, 8:11]])
-
-    mins = all_coords.min(axis=0)
-    maxs = all_coords.max(axis=0)
-    center = (mins + maxs) / 2
-
-    # Get max range for cube domain
-    max_range = np.max(maxs - mins)
-    buffer = max_range * 0.1
-
-    # Fixed limits for all frames
-    plot_limit = (max_range / 2) + buffer
-    x_range = [center[0] - plot_limit, center[0] + plot_limit]
-    y_range = [center[1] - plot_limit, center[1] + plot_limit]
-    z_range = [center[2] - plot_limit, center[2] + plot_limit]
-
-    # Build frames
-    for t in range(len(qs)):
-        row = qs[t]
-        q_points = [row[0:3], row[4:7], row[8:11]]
-        frames.append(
-            go.Frame(
-                data=[
-                    go.Scatter3d(
-                        x=[q_points[0][0], q_points[1][0], q_points[2][0]],
-                        y=[q_points[0][1], q_points[1][1], q_points[2][1]],
-                        z=[q_points[0][2], q_points[1][2], q_points[2][2]],
-                        mode="lines+markers",
-                        line=dict(color="black", width=7),
-                    ),
-                ],
-                name=str(t),
-            )
-        )
-
-    fig = go.Figure(
-        data=frames[0].data,
-        layout=go.Layout(
-            scene=dict(
-                xaxis=dict(range=x_range, autorange=False),
-                yaxis=dict(range=y_range, autorange=False),
-                zaxis=dict(range=z_range, autorange=False),
-                aspectmode="cube",  # Forces 1:1:1 scale visuals
-            ),
-            updatemenus=[
-                {
-                    "buttons": [
-                        {
-                            "args": [
-                                None,
-                                {
-                                    "frame": {"duration": 50, "redraw": True},
-                                    "fromcurrent": True,
-                                },
-                            ],
-                            "label": "Play",
-                            "method": "animate",
-                        },
-                        {
-                            "args": [
-                                [None],
-                                {
-                                    "frame": {"duration": 0, "redraw": True},
-                                    "mode": "immediate",
-                                },
-                            ],
-                            "label": "Pause",
-                            "method": "animate",
-                        },
-                    ],
-                    "type": "buttons",
-                    "showactive": False,
-                }
-            ],
-            sliders=[
-                {
-                    "steps": [
-                        {
-                            "args": [
-                                [f.name],
-                                {
-                                    "frame": {"duration": 0, "redraw": True},
-                                    "mode": "immediate",
-                                },
-                            ],
-                            "label": f.name,
-                            "method": "animate",
-                        }
-                        for f in frames
-                    ]
-                }
-            ],
-        ),
-        frames=frames,
-    )
-    return fig
+    return model, train_history, valid_history
