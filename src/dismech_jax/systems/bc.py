@@ -31,7 +31,13 @@ class LinearBC(AbstractBC):
     xb_c: jax.Array
 
     def apply(self, q: jax.Array, _lambda: jax.Array) -> jax.Array:
-        return q.at[self.idx_b].set(self.xb_m * _lambda + self.xb_c)
+        values = self.xb_m * _lambda + self.xb_c
+
+        # Handle accidental singleton leading dimension, e.g. (1, n_b) -> (n_b,)
+        if values.ndim == 2 and values.shape[0] == 1:
+            values = jnp.squeeze(values, axis=0)
+
+        return q.at[self.idx_b].set(values)
 
     def mask(self, q: jax.Array) -> jax.Array:
         return jnp.ones_like(q).at[self.idx_b].set(0.0)

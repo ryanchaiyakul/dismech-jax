@@ -238,10 +238,42 @@ class Rod(System[TripletState]):
         args = (model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dlambda)
         if not self.is_batched(self.in_axes):
             return solve(*args)
+        
+
+        # Infer batch size from a batched field.
+        batch_size = None
+
+        if self.bc is not None and self.bc.in_axes is not None:
+            if getattr(self.bc.in_axes, "xb_m", None) == 0:
+                batch_size = self.bc.xb_m.shape[0]
+            elif getattr(self.bc.in_axes, "xb_c", None) == 0:
+                batch_size = self.bc.xb_c.shape[0]
+            elif getattr(self.bc.in_axes, "idx_b", None) == 0:
+                batch_size = self.bc.idx_b.shape[0]
+
+        if batch_size is None and self.E_ext is not None and self.E_ext.in_axes is not None:
+            if getattr(self.E_ext.in_axes, "F_ext", None) == 0:
+                batch_size = self.E_ext.F_ext.shape[0]
+
+        if batch_size is None:
+            raise ValueError("Rod is marked batched, but could not infer batch size.")
+
+        # Auto-broadcast q0 if needed
+        q0 = self.q0
+        if q0.ndim == 1:
+            q0 = jnp.broadcast_to(q0[None, :], (batch_size, q0.shape[0]))
+        elif q0.ndim == 2:
+            if q0.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batched q0 has wrong batch size: q0.shape={q0.shape}, expected batch size {batch_size}"
+                )
+        else:
+            raise ValueError(f"Expected q0 to have ndim 1 or 2, got shape {q0.shape}")
+
         return eqx.filter_vmap(
             solve,
-            in_axes=(None, None, None, None, self.in_axes, None, None, None, None),
-        )(*args)
+            in_axes=(None, None, 0, None, self.in_axes, None, None, None, None),
+        )(model, lambdas, q0, aux, self, iters, ls_steps, c1, max_dlambda)
 
     @staticmethod
     def _global_q_to_batch_q(q: jax.Array) -> jax.Array:
