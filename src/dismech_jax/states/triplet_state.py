@@ -21,7 +21,7 @@ class TripletState(State):
         ee = n1 - n0
         ef = n2 - n1
         te = ee / jnp.linalg.norm(ee)
-        tf = ee / jnp.linalg.norm(ef)
+        tf = ef / jnp.linalg.norm(ef)
         d1e = parallel_transport(d1e_old, te_old, te)
         d1f = parallel_transport(d1f_old, tf_old, tf)
         t_new = jnp.array([te, tf])

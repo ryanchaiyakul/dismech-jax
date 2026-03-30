@@ -203,3 +203,44 @@ def solve_bwd(
     batched_grads = batched_ift_fn(lambdas, qs, grad_obj, model, auxs, sys)
     total_grad = jax.tree.map(lambda x: jnp.sum(x, axis=0), batched_grads)
     return total_grad
+
+
+### for debugging: return strains too
+@eqx.filter_jit
+def solve_with_aux(
+    model,
+    lambdas,
+    q0,
+    aux,
+    sys,
+    iters=10,
+    ls_steps=10,
+    c1=1e-4,
+    max_dt=1e-1,
+):
+    def scan_fn(res, target_lambda):
+        _q, _aux, _current_lambda = res
+
+        def cond_fn(val):
+            _, _, curr_L = val
+            return curr_L < target_lambda
+
+        def body_fn(carry):
+            q, aux, curr_L = carry
+            next_L = jnp.minimum(curr_L + max_dt, target_lambda)
+            new_q = solve_step(model, next_L, q, aux, sys, iters, ls_steps, c1)
+            new_aux = jax.vmap(lambda a: a.update(new_q))(aux) if aux else aux
+            return new_q, new_aux, next_L
+
+        final_q, final_aux, final_L = jax.lax.while_loop(
+            cond_fn, body_fn, (_q, _aux, _current_lambda)
+        )
+        return (final_q, final_aux, final_L), (final_q, final_aux)
+
+    q_start = solve_step(model, lambdas[0], q0, aux, sys, iters, ls_steps, c1)
+    aux_start = jax.vmap(lambda a: a.update(q_start))(aux) if aux else aux
+
+    _, (qs, auxs) = jax.lax.scan(
+        scan_fn, (q_start, aux_start, lambdas[0]), lambdas
+    )
+    return qs, auxs

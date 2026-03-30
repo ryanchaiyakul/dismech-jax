@@ -241,7 +241,6 @@ def _dataset_loss(
     Averages the trajectory losses over all trajectories in the dataset.
     """
     lambdas = _get_dataset_lambdas(dataset)
-    print("lambdas: ", lambdas)
     idx_b_all = _get_idx_b_all(dataset)
 
     losses = jax.vmap(

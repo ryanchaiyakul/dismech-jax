@@ -13,7 +13,7 @@ from ..stencils import Triplet, Triplet2D
 from ..states import TripletState
 from ..params import Geometry, Material
 from .system import System
-from ..solver import solve
+from ..solver import solve, solve_with_aux
 
 
 class Rod(System[TripletState]):
@@ -319,3 +319,130 @@ class Rod(System[TripletState]):
         """Returns True if any leaf in the PyTree is not None."""
         leaves = jax.tree_util.tree_leaves(axes)
         return any(leaf is not None for leaf in leaves)
+ 
+    ### for debugging: return strains too
+    @eqx.filter_jit
+    def solve_with_aux(
+        self,
+        model: eqx.Module,
+        lambdas: jax.Array,
+        aux: TripletState,
+        iters: int = 10,
+        ls_steps: int = 10,
+        c1: float = 1e-4,
+        max_dlambda: float = 1e-1,
+    ):
+        """Helper solve function which also returns auxiliary state history.
+
+        Args:
+            model (eqx.Module): energy model.
+            lambdas (jax.Array): lambdas `(N,)`.
+            aux (TripletState): Initial triplet state.
+            iters (int, optional): Number of Newton-Raphson iterations.
+            ls_steps (int, optional): Number of alphas evaluated.
+            c1 (float, optional): Armijo coefficient.
+            max_dlambda (float, optional): Maximum lambda step size.
+
+        Returns:
+            qs: solved state `(N, # of DOFs)` or `(B, N, # of DOFs)`
+            auxs: aux history with matching batch/time dimensions
+        """
+        args = (model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dlambda)
+
+        if not self.is_batched(self.in_axes):
+            return solve_with_aux(*args)
+
+        # Infer batch size from a batched field.
+        batch_size = None
+
+        if self.bc is not None and self.bc.in_axes is not None:
+            if getattr(self.bc.in_axes, "xb_m", None) == 0:
+                batch_size = self.bc.xb_m.shape[0]
+            elif getattr(self.bc.in_axes, "xb_c", None) == 0:
+                batch_size = self.bc.xb_c.shape[0]
+            elif getattr(self.bc.in_axes, "idx_b", None) == 0:
+                batch_size = self.bc.idx_b.shape[0]
+
+        if batch_size is None and self.E_ext is not None and self.E_ext.in_axes is not None:
+            if getattr(self.E_ext.in_axes, "F_ext", None) == 0:
+                batch_size = self.E_ext.F_ext.shape[0]
+
+        if batch_size is None:
+            raise ValueError("Rod is marked batched, but could not infer batch size.")
+
+        # Auto-broadcast q0 if needed
+        q0 = self.q0
+        if q0.ndim == 1:
+            q0 = jnp.broadcast_to(q0[None, :], (batch_size, q0.shape[0]))
+        elif q0.ndim == 2:
+            if q0.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batched q0 has wrong batch size: q0.shape={q0.shape}, expected batch size {batch_size}"
+                )
+        else:
+            raise ValueError(f"Expected q0 to have ndim 1 or 2, got shape {q0.shape}")
+
+        return eqx.filter_vmap(
+            solve_with_aux,
+            in_axes=(None, None, 0, None, self.in_axes, None, None, None, None),
+        )(model, lambdas, q0, aux, self, iters, ls_steps, c1, max_dlambda)
+    
+    def get_del_strain_history(self, qs: jax.Array, auxs: TripletState) -> jax.Array:
+        """
+        Handles both:
+        unbatched:
+            qs.shape      == (N, n_dof)
+            auxs.t.shape  == (N, n_triplets, 2, 3)
+
+        batched:
+            qs.shape      == (B, N, n_dof)
+            auxs.t.shape  == (B, N, n_triplets, 2, 3)
+
+        Returns:
+        unbatched: (N, n_triplets, 5)
+        batched:   (B, N, n_triplets, 5)
+        """
+        # Batched case
+        if qs.ndim == 3:
+            out = []
+            for b in range(qs.shape[0]):
+                aux_b = TripletState(
+                    t=auxs.t[b],
+                    d1=auxs.d1[b],
+                    beta=auxs.beta[b],
+                )
+                out.append(self.get_del_strain_history(qs[b], aux_b))
+            return jnp.stack(out, axis=0)
+
+        # Unbatched case
+        del_strains_all = []
+
+        n_steps = qs.shape[0]
+        n_triplets = self.triplets.bar_strain.shape[0]
+
+        for k in range(n_steps):
+            qk = qs[k]
+
+            t_k = auxs.t[k]       # (n_triplets, 2, 3)
+            d1_k = auxs.d1[k]     # (n_triplets, 2, 3)
+            beta_k = auxs.beta[k] # (n_triplets,)
+
+            del_strains_k = []
+            for i in range(n_triplets):
+                triplet_i = Triplet(
+                    bar_strain=self.triplets.bar_strain[i],
+                    l_k=self.triplets.l_k[i],
+                )
+
+                aux_i = TripletState(
+                    t=t_k[i],
+                    d1=d1_k[i],
+                    beta=beta_k[i],
+                )
+
+                del_strain_i = triplet_i.get_strain(qk, aux_i) - triplet_i.bar_strain
+                del_strains_k.append(del_strain_i)
+
+            del_strains_all.append(jnp.stack(del_strains_k, axis=0))
+
+        return jnp.stack(del_strains_all, axis=0)
