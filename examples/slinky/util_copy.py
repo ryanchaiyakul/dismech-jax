@@ -115,7 +115,7 @@ def train_model(
     train_lambdas = jnp.linspace(0.0, 1.0, train.qs.shape[0])
     valid_lambdas = jnp.linspace(0.0, 1.0, valid.qs.shape[0])
 
-    model = cls(der_K=init_K, key=key)
+    model = cls(der_K=init_K, l_k=base.triplets.l_k[0,0] , key=key)
 
     init_K = model.get_K_entries(jnp.zeros(5))
     ####################
