@@ -1,5 +1,4 @@
 from __future__ import annotations
-import warnings
 from abc import abstractmethod
 
 import jax
@@ -16,8 +15,7 @@ import dismech_jax
 
 class TestCase(eqx.Module):
     idx_b: jax.Array
-    xb_c: jax.Array
-    xb_m: jax.Array
+    xb: jax.Array
     qs: jax.Array
     lambdas: jax.Array | None = None
 
@@ -26,16 +24,13 @@ class TestCase(eqx.Module):
         data = np.load(filename)
 
         idx_b = jnp.asarray(data["idx_b"])
-        xb_c = jnp.asarray(data["xb_c"])
-        xb_m = jnp.asarray(data["xb_m"])
-        # xb_m = jnp.squeeze(xb_m, axis=1)
+        xb = jnp.asarray(data["xb"])
         qs = jnp.asarray(data["qs"])
         lambdas = jnp.asarray(data["lambdas"]) if "lambdas" in data else None
 
         # Expected:
         # qs    : (n_traj, n_lambda, n_dof)
-        # xb_c  : (n_traj, n_b)
-        # xb_m  : (n_traj, n_b)
+        # xb    : (n_traj, n_lambda, n_b)
         # idx_b : (n_b,) or (n_traj, n_b)
 
         if qs.ndim != 3:
@@ -44,54 +39,37 @@ class TestCase(eqx.Module):
                 f"got shape {qs.shape}"
             )
 
-        if xb_c.ndim != 2:
-            print("xb_c: ", xb_c)
-            xb_c = jnp.broadcast_to(xb_c, (qs.shape[0], xb_c.shape[0]))
-            warnings.warn(
-                f"{filename}: expected xb_c to have shape (n_traj, n_b), "
-                f"got shape {xb_c.shape}. Using same xb_c for all trajectories."
+        if xb.ndim != 3:
+            raise ValueError(
+                f"{filename}: expected xb to have shape (n_traj, n_lambda, n_b), "
+                f"got shape {xb.shape}"
             )
-            
 
-        if xb_m.ndim != 3:
-            print("xb_m: ", xb_m)
-            xb_m = jnp.broadcast_to(xb_m, (qs.shape[0], xb_m.shape[0]))
-            warnings.warn(
-                f"{filename}: expected xb_m to have shape (n_traj, n_b), "
-                f"got shape {xb_m.shape}. Using same xb_m for all trajectories."
-            )
-            
         n_traj, n_lambda, _ = qs.shape
 
-        if xb_c.shape[0] != n_traj:
+        if xb.shape[0] != n_traj:
             raise ValueError(
-                f"{filename}: xb_c.shape[0] must match qs.shape[0]. "
-                f"Got xb_c.shape={xb_c.shape}, qs.shape={qs.shape}"
+                f"{filename}: xb.shape[0] must match qs.shape[0]. "
+                f"Got xb.shape={xb.shape}, qs.shape={qs.shape}"
             )
 
-        if xb_m.shape[0] != n_traj:
+        if xb.shape[1] != n_lambda:
             raise ValueError(
-                f"{filename}: xb_m.shape[0] must match qs.shape[0]. "
-                f"Got xb_m.shape={xb_m.shape}, qs.shape={qs.shape}"
+                f"{filename}: xb.shape[1] must match qs.shape[1]. "
+                f"Got xb.shape={xb.shape}, qs.shape={qs.shape}"
             )
-
-        # if xb_c.shape != xb_m.shape:
-        #     raise ValueError(
-        #         f"{filename}: xb_c and xb_m must have the same shape. "
-        #         f"Got xb_c.shape={xb_c.shape}, xb_m.shape={xb_m.shape}"
-        #     )
 
         if idx_b.ndim == 1:
-            if idx_b.shape[0] != xb_c.shape[1]:
+            if idx_b.shape[0] != xb.shape[2]:
                 raise ValueError(
                     f"{filename}: shared idx_b has incompatible size. "
-                    f"Got idx_b.shape={idx_b.shape}, xb_c.shape={xb_c.shape}"
+                    f"Got idx_b.shape={idx_b.shape}, xb.shape={xb.shape}"
                 )
         elif idx_b.ndim == 2:
-            if idx_b.shape != xb_c.shape:
+            if idx_b.shape != (n_traj, xb.shape[2]):
                 raise ValueError(
                     f"{filename}: per-trajectory idx_b must have shape (n_traj, n_b). "
-                    f"Got idx_b.shape={idx_b.shape}, xb_c.shape={xb_c.shape}"
+                    f"Got idx_b.shape={idx_b.shape}, expected {(n_traj, xb.shape[2])}"
                 )
         else:
             raise ValueError(
@@ -106,7 +84,7 @@ class TestCase(eqx.Module):
                     f"got shape {lambdas.shape} with qs.shape={qs.shape}"
                 )
 
-        return cls(idx_b=idx_b, xb_c=xb_c, xb_m=xb_m, qs=qs, lambdas=lambdas)
+        return cls(idx_b=idx_b, xb=xb, qs=qs, lambdas=lambdas)
 
 
 class TripletModel(eqx.Module):
@@ -153,12 +131,18 @@ def validate_model(cls: type, der_K: jax.Array) -> None:
             f"validate_model: obj.__call__ must return a scalar, got shape {jnp.shape(out)}"
         )
 
-def get_base_rod():
-    geom = dismech_jax.Geometry(0.5, 5e-3)
-    mat = dismech_jax.Material(1273.52, 1e7)
-    temp, aux = dismech_jax.Rod.from_geometry(geom, mat, N=3)
 
-    MASS = 0.647
+def get_base_rod():
+    geom = dismech_jax.Geometry(0.225, 5e-3)
+    mat = dismech_jax.Material(1273.52, 1e7)
+    temp, aux = dismech_jax.Rod.from_endpoints(
+        start=jnp.array([0.0, 0.0, 0.0]),
+        end=jnp.array([0.3024303, 0.0, 0.02364909 ]),
+        material=mat,
+        N=3
+    )
+
+    MASS = 0.032
     F_new = jnp.array(
         [
             0.0,
@@ -204,8 +188,7 @@ def _trajectory_loss(
     base: dismech_jax.Rod,
     aux: jax.Array,
     idx_b: jax.Array,
-    xb_c: jax.Array,
-    xb_m: jax.Array,
+    xb: jax.Array,
     lambdas: jax.Array,
     truth_qs: jax.Array,
 ) -> jax.Array:
@@ -213,9 +196,14 @@ def _trajectory_loss(
     Computes loss for one trajectory.
 
     truth_qs has shape (n_lambda, n_dof)
-    xb_c, xb_m, idx_b have shape (n_b,)
+    xb has shape (n_lambda, n_b)
+    idx_b has shape (n_b,)
     """
-    bc = dismech_jax.BatchedLinearBC(idx_b=idx_b, xb_c=xb_c, xb_m=xb_m)
+    bc = dismech_jax.DirectBC(
+        idx_b=idx_b,
+        xb=xb,
+        lambdas=lambdas,
+    )
     rod = base.with_bc(bc)
 
     pred = rod.solve(
@@ -244,17 +232,16 @@ def _dataset_loss(
     idx_b_all = _get_idx_b_all(dataset)
 
     losses = jax.vmap(
-        lambda idx_b, xb_c, xb_m, truth_qs: _trajectory_loss(
+        lambda idx_b, xb, truth_qs: _trajectory_loss(
             model=model,
             base=base,
             aux=aux,
             idx_b=idx_b,
-            xb_c=xb_c,
-            xb_m=xb_m,
+            xb=xb,
             lambdas=lambdas,
             truth_qs=truth_qs,
         )
-    )(idx_b_all, dataset.xb_c, dataset.xb_m, dataset.qs)
+    )(idx_b_all, dataset.xb, dataset.qs)
 
     return jnp.mean(losses)
 
@@ -266,7 +253,7 @@ def train_model(
     valid_file: str = "valid.npz",
     n_epochs: int = 100,
     lr: float = 1e-2,
-    init_K=jnp.array([2.0, 0.01, 0.02]),  # stretching, coupled, bending stiffness initial values, can be overridden by user input
+    init_K=jnp.array([0.1, 0.05]),
 ) -> tuple:
     # validate_model(cls, init_K)
 
@@ -275,8 +262,8 @@ def train_model(
     train = TestCase.from_npz(train_file)
     valid = TestCase.from_npz(valid_file)
 
-    model = cls(der_K=init_K, l_k=base.triplets.l_k[0,0], key=key)
-    init_K = model.get_K_entries(jnp.zeros(5))
+    model = cls(der_K=init_K, key=key)
+    init_K = model.K
 
     schedule = optax.cosine_decay_schedule(
         init_value=lr,
@@ -286,6 +273,15 @@ def train_model(
 
     optimizer = optax.adam(schedule)
     opt_state = optimizer.init(model)
+
+    ### degbugging: check initial loss
+    initial_loss = _dataset_loss(model, base, aux, train)
+    print(f"Initial training loss: {initial_loss:.5e}")
+    grads = eqx.filter_grad(_dataset_loss)(model, base, aux, train)
+    print("K:", model.K)
+    print("grad K:", grads.K)
+    print("loss finite?", jnp.isfinite(initial_loss))
+    print("grad finite?", jnp.all(jnp.isfinite(grads.K)))
 
     @eqx.filter_jit
     def run_training(model, opt_state, num_steps: int, val_interval: int = 10):
@@ -316,7 +312,7 @@ def train_model(
                 current_lr,
                 train_loss,
                 valid_loss,
-                next_m.get_K_entries(jnp.zeros(5)),
+                next_m.K,
             )
 
             return (next_m, next_s), (train_loss, valid_loss)
@@ -331,3 +327,65 @@ def train_model(
     )
 
     return model, init_K, train_history, valid_history
+
+def debug_dataset_loss(model, base, aux, dataset):
+    lambdas = _get_dataset_lambdas(dataset)
+    idx_b_all = _get_idx_b_all(dataset)
+
+    all_losses = []
+
+    print("dataset.qs.shape =", dataset.qs.shape)
+    print("dataset.xb.shape =", dataset.xb.shape)
+    print("idx_b_all.shape =", idx_b_all.shape)
+    print("lambdas.shape =", lambdas.shape)
+    print("model.K =", model.K)
+
+    for i in range(dataset.qs.shape[0]):
+        idx_b_i = idx_b_all[i]
+        xb_i = dataset.xb[i]
+        truth_i = dataset.qs[i]
+
+        print(f"\n--- trajectory {i} ---")
+        print("idx_b_i.shape =", idx_b_i.shape)
+        print("xb_i.shape    =", xb_i.shape)
+        print("truth_i.shape =", truth_i.shape)
+
+        bc = dismech_jax.DirectBC(
+            idx_b=idx_b_i,
+            xb=xb_i,
+            lambdas=lambdas,
+        )
+        rod = base.with_bc(bc)
+
+        pred_i = rod.solve(
+            model,
+            lambdas,
+            aux,
+            max_dlambda=5e-3,
+            iters=5,
+            ls_steps=10,
+        )
+
+        print("pred_i.shape =", pred_i.shape)
+        print("pred finite? ", jnp.all(jnp.isfinite(pred_i)))
+        print("truth finite?", jnp.all(jnp.isfinite(truth_i)))
+
+        if pred_i.shape != truth_i.shape:
+            print("SHAPE MISMATCH:", pred_i.shape, truth_i.shape)
+
+        diff_i = pred_i - truth_i
+        sq_i = jnp.square(diff_i)
+        loss_i = jnp.mean(sq_i)
+
+        print("diff finite? ", jnp.all(jnp.isfinite(diff_i)))
+        print("sq finite?   ", jnp.all(jnp.isfinite(sq_i)))
+        print("loss_i       =", loss_i)
+
+        all_losses.append(loss_i)
+
+    all_losses = jnp.array(all_losses)
+    print("\nall_losses =", all_losses)
+    print("all_losses finite?", jnp.all(jnp.isfinite(all_losses)))
+    print("mean loss =", jnp.mean(all_losses))
+
+    return jnp.mean(all_losses)

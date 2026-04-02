@@ -8,6 +8,8 @@ from .systems import (
     AbstractBC,
     LinearBC,
     BatchedLinearBC,
+    DirectBC,
+    BatchedDirectBC,
     AbstractEnergy,
     Gravity,
 )

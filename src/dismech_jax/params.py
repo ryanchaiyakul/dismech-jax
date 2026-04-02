@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 @dataclass
 class Geometry:
-    length: float
-    r0: float
+    length: float | None = None
+    r0: float = 0.005
     axs: float | None = None
     jxs: float | None = None
     ixs1: float | None = None

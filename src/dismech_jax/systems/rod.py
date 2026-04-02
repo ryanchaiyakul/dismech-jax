@@ -33,7 +33,7 @@ class Rod(System[TripletState]):
         origin: jax.Array = jnp.array([0.0, 0.0, 0.0]),
         gravity: float = -9.81,
         is_2d: bool = False,
-    ) -> tuple[Rod, TripletState | None]:
+    ) -> tuple["Rod", TripletState | None]:
         if N < 3:
             raise ValueError("Cannot create a rod with less than 3 nodes.")
         if geom.length < 1e-6:
@@ -81,57 +81,118 @@ class Rod(System[TripletState]):
             mass=mass,
         )
         return rod, batch_aux
+    
+    @classmethod
+    def from_endpoints(
+        cls,
+        start: jax.Array,
+        end: jax.Array,
+        material: Material,
+        N: int = 30,
+        bc: AbstractBC = AbstractBC(),
+        gravity: float = -9.81,
+        is_2d: bool = False,
+    ) -> tuple["Rod", TripletState | None]:
 
-    def with_bc(self, bc: AbstractBC) -> Rod:
-        """Get a new Rod PyTree with `self.bc` replaced with passed `bc`.
+        if N < 3:
+            raise ValueError("Cannot create a rod with less than 3 nodes.")
 
-        Args:
-            bc (AbstractBC): Subclassed boundary condition object.
+        start = jnp.asarray(start)
+        end = jnp.asarray(end)
 
-        Returns:
-            Rod: rod object.
-        """
+        length = jnp.linalg.norm(end - start)
+        if length < 1e-6:
+            raise ValueError("Start and end points are too close.")
+
+        # ---------------------------------------
+        # 1. Interpolate positions
+        # ---------------------------------------
+        alphas = jnp.linspace(0.0, 1.0, N)[:, None]  # (N,1)
+        points = start + alphas * (end - start)      # (N,3)
+
+        # ---------------------------------------
+        # 2. Build q0
+        # ---------------------------------------
+        q0 = jnp.zeros(4 * N - 1)
+        q0 = q0.at[0::4].set(points[:, 0])
+        q0 = q0.at[1::4].set(points[:, 1])
+        q0 = q0.at[2::4].set(points[:, 2])
+
+        batch_q = Rod._global_q_to_batch_q(q0)
+
+        # ---------------------------------------
+        # 3. Segment lengths
+        # ---------------------------------------
+        l_ks = jnp.linalg.norm(points[1:] - points[:-1], axis=1)
+
+        mass = Rod._get_mass(
+        Geometry(length=length), material, l_ks
+        )
+
+        # ---------------------------------------
+        # 4. Triplet construction
+        # ---------------------------------------
+        N_triplets = batch_q.shape[0]
+
+        batch_l_ks = jax.vmap(
+            lambda i: jax.lax.dynamic_slice(l_ks, (i,), (2,))
+        )(jnp.arange(N_triplets))
+
+        if is_2d:
+            batch_aux = None
+            triplets = jax.vmap(lambda q, l_k: Triplet2D.init(q, None, l_k=l_k))(
+                batch_q, batch_l_ks
+            )
+        else:
+            # Compute tangent direction
+            direction = (end - start) / length
+
+            # Construct orthonormal frame (simple version)
+            # pick arbitrary perpendicular vector
+            ref = jnp.array([0.0, 0.0, 1.0])
+            d1 = jnp.cross(direction, ref)
+            d1 = d1 / (jnp.linalg.norm(d1) + 1e-8)
+
+            t_pair = jnp.stack([direction, direction])
+            d1_pair = jnp.stack([d1, d1])
+
+            ts = jnp.broadcast_to(t_pair, (N_triplets, 2, 3))
+            d1s = jnp.broadcast_to(d1_pair, (N_triplets, 2, 3))
+            betas = jnp.zeros(N_triplets)
+
+            batch_aux = jax.vmap(TripletState)(ts, d1s, betas)
+
+            triplets = jax.vmap(
+                lambda q, a, l_k: Triplet.init(q, a, l_k=l_k)
+            )(batch_q, batch_aux, batch_l_ks)
+
+        # ---------------------------------------
+        # 5. External force (gravity)
+        # ---------------------------------------
+        F_ext = jnp.zeros_like(q0).at[2::4].set(mass[2::4] * gravity)
+
+        rod = Rod(
+            triplets=triplets,
+            E_ext=Gravity(F_ext),
+            bc=bc,
+            q0=q0,
+            mass=mass,
+        )
+
+        return rod, batch_aux
+
+    def with_bc(self, bc: AbstractBC) -> "Rod":
         return eqx.tree_at(lambda r: r.bc, self, bc)
 
     def get_DER(self, geom: Geometry, material: Material) -> DER:
-        """Get a DER energy model for `self.solve(model, ...)`.
-
-        Args:
-            geom (Geometry): Geometry object.
-            material (Material): Material object.
-
-        Returns:
-            DER: Energy model.
-        """
-        # Assumes nodes are evenly spaced
         return DER.from_legacy(self.triplets.l_k[0, 0], geom, material)
 
     def get_q(self, _lambda: jax.Array, q0: jax.Array) -> jax.Array:
-        """Get `q0` with applied with boundary condition at `_lambda`.
-
-        Args:
-            _lambda (jax.Array): Lambda.
-            q0 (jax.Array): Initial state.
-
-        Returns:
-            jax.Array: State with applied boundary condition.
-        """
         return self.bc.apply(q0, _lambda)
 
     def get_E(
         self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
     ) -> jax.Array:
-        """Get scalar energy of state `q` at `_lambda` after applied boundary condition.
-
-        Args:
-            _lambda (jax.Array): Lambda.
-            q (jax.Array): Initial state.
-            model (eqx.Module): Energy model.
-            aux (TripletState): Triplet director object.
-
-        Returns:
-            jax.Array: Scalar energy.
-        """
         batch_qs = self._global_q_to_batch_q(q)
         E_int = jnp.sum(
             jax.vmap(lambda t, q_loc, _aux: t.get_energy(q_loc, model, _aux))(
@@ -143,34 +204,12 @@ class Rod(System[TripletState]):
     def get_F(
         self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
     ) -> jax.Array:
-        """Get vector force of state `q` at `_lambda` after applied boundary condition.
-
-        Args:
-            _lambda (jax.Array): Lambda.
-            q (jax.Array): Initial state.
-            model (eqx.Module): Energy model.
-            aux (TripletState): Triplet director object.
-
-        Returns:
-            jax.Array: Vector force.
-        """
         mask = self.bc.mask(q)
         return mask * jax.grad(self.get_E, 1)(_lambda, q, model, aux)
 
     def get_H(
         self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
     ) -> jax.Array:
-        """Get square Hessian of state `q` at `_lambda` after applied boundary condition.
-
-        Args:
-            _lambda (jax.Array): Lambda.
-            q (jax.Array): Initial state.
-            model (eqx.Module): Energy model.
-            aux (TripletState): Triplet director object.
-
-        Returns:
-            jax.Array: square Hessian.
-        """
         mask = self.bc.mask(q)
         H = jax.hessian(self.get_E, 1)(_lambda, q, model, aux)
         H = H * mask[:, None] * mask[None, :]
@@ -178,12 +217,6 @@ class Rod(System[TripletState]):
         return H.at[diag_idx, diag_idx].add(1.0 - mask)
 
     def get_ode_term(self) -> diffrax.ODETerm:
-        """Get `diffrax.ODETerm` to solve a ODE.
-
-        Returns:
-            diffrax.ODETerm: ODETerm object.
-        """
-
         if self.is_batched(self.in_axes):
             raise NotImplementedError(
                 f"get_ode_term: {self} contains a batched BC or E_ext. This is not supported yet!"
@@ -194,21 +227,60 @@ class Rod(System[TripletState]):
             model, aux = args
             _lambda = jnp.asarray(_lambda)
 
-            # split [q, v]
             n_dofs = self.q0.shape[0]
             q, v = y[:n_dofs], y[n_dofs:]
 
-            # Get fixed DOF
             q_fixed, v_fixed = jax.jvp(
                 lambda l: self.bc.apply(q, l), (_lambda,), (jnp.ones_like(_lambda),)
             )
 
-            # update [q, v]
             v = v * self.bc.mask(q) + v_fixed * (1.0 - self.bc.mask(q))
             a = -self.get_F(_lambda, q_fixed, model, aux) / self.mass
             return jnp.concatenate([v, a])
 
         return diffrax.ODETerm(rhs)
+
+    def _infer_batch_size(self) -> int:
+        """
+        Infer batch size from batched BC or batched external energy.
+
+        Supports:
+        - BatchedLinearBC with xb_m / xb_c / idx_b
+        - BatchedDirectBC with xb / idx_b
+        """
+        batch_size = None
+
+        if self.bc is not None and self.bc.in_axes is not None:
+            if getattr(self.bc.in_axes, "xb_m", None) == 0:
+                batch_size = self.bc.xb_m.shape[0]
+            elif getattr(self.bc.in_axes, "xb_c", None) == 0:
+                batch_size = self.bc.xb_c.shape[0]
+            elif getattr(self.bc.in_axes, "xb", None) == 0:
+                batch_size = self.bc.xb.shape[0]
+            elif getattr(self.bc.in_axes, "idx_b", None) == 0:
+                batch_size = self.bc.idx_b.shape[0]
+
+        if batch_size is None and self.E_ext is not None and self.E_ext.in_axes is not None:
+            if getattr(self.E_ext.in_axes, "F_ext", None) == 0:
+                batch_size = self.E_ext.F_ext.shape[0]
+
+        if batch_size is None:
+            raise ValueError("Rod is marked batched, but could not infer batch size.")
+
+        return batch_size
+
+    def _broadcast_q0_for_batch(self, batch_size: int) -> jax.Array:
+        q0 = self.q0
+        if q0.ndim == 1:
+            q0 = jnp.broadcast_to(q0[None, :], (batch_size, q0.shape[0]))
+        elif q0.ndim == 2:
+            if q0.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batched q0 has wrong batch size: q0.shape={q0.shape}, expected batch size {batch_size}"
+                )
+        else:
+            raise ValueError(f"Expected q0 to have ndim 1 or 2, got shape {q0.shape}")
+        return q0
 
     @eqx.filter_jit
     def solve(
@@ -221,54 +293,12 @@ class Rod(System[TripletState]):
         c1: float = 1e-4,
         max_dlambda: float = 1e-1,
     ) -> jax.Array:
-        """Helper solve function which batches BC and external energy if necessary.
-
-        Args:
-            model (eqx.Module): energy model.
-            lambdas (jax.Array): lambdas `(N,)`.
-            aux (TripletState): Initial triplet state.
-            iters (int, optional): Number of newton-raphson iterations. Defaults to 10.
-            ls_steps (int, optional): Number of alphas evaluated. Defaults to 10.
-            c1 (float, optional): Armijo coefficient. Defaults to 1e-4.
-            max_dlambda (float, optional): Maximum lambda step size. Defaults to 1e-1.
-
-        Returns:
-            jax.Array: Solved state `(N, # of DOFs)` or `(B, N, # of DOFs)`.
-        """
         args = (model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dlambda)
         if not self.is_batched(self.in_axes):
             return solve(*args)
-        
 
-        # Infer batch size from a batched field.
-        batch_size = None
-
-        if self.bc is not None and self.bc.in_axes is not None:
-            if getattr(self.bc.in_axes, "xb_m", None) == 0:
-                batch_size = self.bc.xb_m.shape[0]
-            elif getattr(self.bc.in_axes, "xb_c", None) == 0:
-                batch_size = self.bc.xb_c.shape[0]
-            elif getattr(self.bc.in_axes, "idx_b", None) == 0:
-                batch_size = self.bc.idx_b.shape[0]
-
-        if batch_size is None and self.E_ext is not None and self.E_ext.in_axes is not None:
-            if getattr(self.E_ext.in_axes, "F_ext", None) == 0:
-                batch_size = self.E_ext.F_ext.shape[0]
-
-        if batch_size is None:
-            raise ValueError("Rod is marked batched, but could not infer batch size.")
-
-        # Auto-broadcast q0 if needed
-        q0 = self.q0
-        if q0.ndim == 1:
-            q0 = jnp.broadcast_to(q0[None, :], (batch_size, q0.shape[0]))
-        elif q0.ndim == 2:
-            if q0.shape[0] != batch_size:
-                raise ValueError(
-                    f"Batched q0 has wrong batch size: q0.shape={q0.shape}, expected batch size {batch_size}"
-                )
-        else:
-            raise ValueError(f"Expected q0 to have ndim 1 or 2, got shape {q0.shape}")
+        batch_size = self._infer_batch_size()
+        q0 = self._broadcast_q0_for_batch(batch_size)
 
         return eqx.filter_vmap(
             solve,
@@ -283,21 +313,19 @@ class Rod(System[TripletState]):
 
     @staticmethod
     def _get_mass(geom: Geometry, material: Material, l_ks: jax.Array) -> jax.Array:
-        N = l_ks.shape[0] + 1  # Number of nodes
+        N = l_ks.shape[0] + 1
         mass = jnp.zeros(N * 4 - 1)
         A = geom.axs if geom.axs else jnp.pi * geom.r0**2
 
-        # Node contributions
         weights = 0.5 * l_ks[0]
         v_ref_len = jnp.ones(N) * 2 * weights
         v_ref_len = v_ref_len.at[0].set(weights)
         v_ref_len = v_ref_len.at[-1].set(weights)
         dm_nodes = v_ref_len * A * material.density
         node_start_indices = jnp.arange(N) * 4
-        for i in range(3):  # Fill x, y, and z
+        for i in range(3):
             mass = mass.at[node_start_indices + i].set(dm_nodes)
 
-        # Edge contributions (moment of inertia)
         factor = geom.jxs / geom.axs if geom.jxs and geom.axs else geom.r0**2 / 2
         dm_edges = l_ks * A * material.density * factor
         edge_indices = jnp.arange(N - 1) * 4 + 3
@@ -305,7 +333,7 @@ class Rod(System[TripletState]):
         return mass
 
     @property
-    def in_axes(self) -> Rod:
+    def in_axes(self) -> "Rod":
         return Rod(
             triplets=None,  # type: ignore
             mass=None,  # type: ignore
@@ -316,11 +344,9 @@ class Rod(System[TripletState]):
 
     @staticmethod
     def is_batched(axes) -> bool:
-        """Returns True if any leaf in the PyTree is not None."""
         leaves = jax.tree_util.tree_leaves(axes)
         return any(leaf is not None for leaf in leaves)
- 
-    ### for debugging: return strains too
+
     @eqx.filter_jit
     def solve_with_aux(
         self,
@@ -332,77 +358,20 @@ class Rod(System[TripletState]):
         c1: float = 1e-4,
         max_dlambda: float = 1e-1,
     ):
-        """Helper solve function which also returns auxiliary state history.
-
-        Args:
-            model (eqx.Module): energy model.
-            lambdas (jax.Array): lambdas `(N,)`.
-            aux (TripletState): Initial triplet state.
-            iters (int, optional): Number of Newton-Raphson iterations.
-            ls_steps (int, optional): Number of alphas evaluated.
-            c1 (float, optional): Armijo coefficient.
-            max_dlambda (float, optional): Maximum lambda step size.
-
-        Returns:
-            qs: solved state `(N, # of DOFs)` or `(B, N, # of DOFs)`
-            auxs: aux history with matching batch/time dimensions
-        """
         args = (model, lambdas, self.q0, aux, self, iters, ls_steps, c1, max_dlambda)
 
         if not self.is_batched(self.in_axes):
             return solve_with_aux(*args)
 
-        # Infer batch size from a batched field.
-        batch_size = None
-
-        if self.bc is not None and self.bc.in_axes is not None:
-            if getattr(self.bc.in_axes, "xb_m", None) == 0:
-                batch_size = self.bc.xb_m.shape[0]
-            elif getattr(self.bc.in_axes, "xb_c", None) == 0:
-                batch_size = self.bc.xb_c.shape[0]
-            elif getattr(self.bc.in_axes, "idx_b", None) == 0:
-                batch_size = self.bc.idx_b.shape[0]
-
-        if batch_size is None and self.E_ext is not None and self.E_ext.in_axes is not None:
-            if getattr(self.E_ext.in_axes, "F_ext", None) == 0:
-                batch_size = self.E_ext.F_ext.shape[0]
-
-        if batch_size is None:
-            raise ValueError("Rod is marked batched, but could not infer batch size.")
-
-        # Auto-broadcast q0 if needed
-        q0 = self.q0
-        if q0.ndim == 1:
-            q0 = jnp.broadcast_to(q0[None, :], (batch_size, q0.shape[0]))
-        elif q0.ndim == 2:
-            if q0.shape[0] != batch_size:
-                raise ValueError(
-                    f"Batched q0 has wrong batch size: q0.shape={q0.shape}, expected batch size {batch_size}"
-                )
-        else:
-            raise ValueError(f"Expected q0 to have ndim 1 or 2, got shape {q0.shape}")
+        batch_size = self._infer_batch_size()
+        q0 = self._broadcast_q0_for_batch(batch_size)
 
         return eqx.filter_vmap(
             solve_with_aux,
             in_axes=(None, None, 0, None, self.in_axes, None, None, None, None),
         )(model, lambdas, q0, aux, self, iters, ls_steps, c1, max_dlambda)
-    
+
     def get_del_strain_history(self, qs: jax.Array, auxs: TripletState) -> jax.Array:
-        """
-        Handles both:
-        unbatched:
-            qs.shape      == (N, n_dof)
-            auxs.t.shape  == (N, n_triplets, 2, 3)
-
-        batched:
-            qs.shape      == (B, N, n_dof)
-            auxs.t.shape  == (B, N, n_triplets, 2, 3)
-
-        Returns:
-        unbatched: (N, n_triplets, 5)
-        batched:   (B, N, n_triplets, 5)
-        """
-        # Batched case
         if qs.ndim == 3:
             out = []
             for b in range(qs.shape[0]):
@@ -414,7 +383,6 @@ class Rod(System[TripletState]):
                 out.append(self.get_del_strain_history(qs[b], aux_b))
             return jnp.stack(out, axis=0)
 
-        # Unbatched case
         del_strains_all = []
 
         n_steps = qs.shape[0]
@@ -423,9 +391,9 @@ class Rod(System[TripletState]):
         for k in range(n_steps):
             qk = qs[k]
 
-            t_k = auxs.t[k]       # (n_triplets, 2, 3)
-            d1_k = auxs.d1[k]     # (n_triplets, 2, 3)
-            beta_k = auxs.beta[k] # (n_triplets,)
+            t_k = auxs.t[k]
+            d1_k = auxs.d1[k]
+            beta_k = auxs.beta[k]
 
             del_strains_k = []
             for i in range(n_triplets):
