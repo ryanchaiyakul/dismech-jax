@@ -11,7 +11,7 @@ dependencies = [
     "beartype>=0.22.9",
     "diffrax>=0.7.2",
     "equinox>=0.13.4",
-    "jax>=0..70",
+    "jax>=0.7.0",
     "typeguard>=4.5.1",
 ]
 
