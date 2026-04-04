@@ -16,8 +16,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = [
+cuda13 = [
     "jax[cuda13]>=0.7.0",
+]
+cuda12 = [
+    "jax[cuda12]>=0.7.0",
 ]
 tpu = [
     "jax[tpu]>=0.7.0",
