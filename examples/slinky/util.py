@@ -116,7 +116,7 @@ def train_model(
     valid_lambdas = jnp.linspace(0.0, 1.0, valid.qs.shape[0])
 
     model = cls(der_K=init_K, key=key)
-    init_K = model.K
+    init_K = model.K0
     ####################
     # Cosine decay schedule
     schedule = optax.cosine_decay_schedule(
@@ -163,7 +163,7 @@ def train_model(
                 current_lr,
                 loss_val,
                 valid_loss,
-                next_m.K, # print learned stiffnesses at each step
+                next_m.K0, # print learned stiffnesses at each step
             )
 
             return (next_m, next_s), (loss_val, valid_loss)
