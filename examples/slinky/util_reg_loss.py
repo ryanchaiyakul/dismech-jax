@@ -45,6 +45,7 @@ class TestCase(eqx.Module):
                 f"got shape {xb_c.shape}. Using same xb_c for all trajectories."
             )
 
+        # expected shape is (n_traj, n_b)
         if xb_m.ndim != 3:
             print("xb_m: ", xb_m)
             xb_m = jnp.broadcast_to(xb_m, (qs.shape[0], xb_m.shape[0]))
@@ -113,11 +114,12 @@ class TripletModel(eqx.Module):
 
 
 def validate_model(cls: type, der_K: jax.Array) -> None:
-    """Validates a provided class as a suitable TripletModel."""
     if not issubclass(cls, TripletModel):
         raise ValueError(f"validate_model: {cls} is not a subclass of {TripletModel}")
 
     try:
+        obj = cls(der_K=jnp.asarray(der_K), key=jax.random.PRNGKey(42), l_k=1.0)
+    except TypeError:
         obj = cls(der_K=jnp.asarray(der_K), key=jax.random.PRNGKey(42))
     except Exception as e:
         raise ValueError(
@@ -174,53 +176,100 @@ def _get_dataset_lambdas(dataset: TestCase) -> jax.Array:
 
 
 def _get_idx_b_all(dataset: TestCase) -> jax.Array:
-    """
-    Returns idx_b with shape (n_traj, n_b), whether the file stored it
-    as shared (n_b,) or per-trajectory (n_traj, n_b).
-    """
     n_traj = dataset.qs.shape[0]
-
     if dataset.idx_b.ndim == 1:
         return jnp.broadcast_to(
             dataset.idx_b[None, :], (n_traj, dataset.idx_b.shape[0])
         )
-
     return dataset.idx_b
 
 
-def spectral_spread_penalty(K: jax.Array, eps: float = 1e-8, max_log_spread: float = None) -> jax.Array:
-    """
-    Penalize the log spectral spread:
-        (log(lambda_max) - log(lambda_min))^2
-    """
-    K = 0.5 * (K + K.T)  # numerical safety
-    eigs = jnp.linalg.eigvalsh(K)  # ascending order
+def spectral_spread_penalty(
+    K: jax.Array,
+    eps: float = 1e-8,
+    max_log_spread: float | None = 2.0,
+) -> jax.Array:
+    K = 0.5 * (K + K.T)
+    eigs = jnp.linalg.eigvalsh(K)
     lam_min = jnp.maximum(eigs[0], eps)
     lam_max = jnp.maximum(eigs[-1], eps)
     log_spread = jnp.log(lam_max) - jnp.log(lam_min)
+
     if max_log_spread is None:
         return log_spread**2
+
     excess = jnp.maximum(log_spread - max_log_spread, 0.0)
     return excess**2
 
-
-def _trajectory_spectral_reg(
-    model: eqx.Module,
-    rod: dismech_jax.Rod,
-    pred_qs: jax.Array,
-    pred_auxs,
+def _alpha_spec_schedule(
+    step_idx: jax.Array,
+    alpha_spec_max: float,
+    start_frac: float = 0.2,
+    ramp_frac: float = 0.3,
+    num_steps: int = 100,
 ) -> jax.Array:
-    del_strain_hist = rod.get_del_strain_history(pred_qs, pred_auxs)
-    del_strain_flat = del_strain_hist.reshape(-1, del_strain_hist.shape[-1])
+    """
+    Piecewise-linear schedule for spectral regularization.
 
+    - no regularization until start_frac * num_steps
+    - linearly ramp to alpha_spec_max over ramp_frac * num_steps
+    - then keep constant
+    """
+    start_step = start_frac * num_steps
+    ramp_steps = jnp.maximum(ramp_frac * num_steps, 1.0)
+
+    progress = (step_idx - start_step) / ramp_steps
+    progress = jnp.clip(progress, 0.0, 1.0)
+
+    return alpha_spec_max * progress
+
+def _build_aux_history_for_qs(aux0, qs: jax.Array):
+    """
+    Build auxiliary frame history from a sequence of configurations qs
+    by repeatedly applying aux.update(q).
+
+    Returns a TripletState-like pytree with leading axis n_steps.
+    """
+    def step(aux_prev, q):
+        aux_next = jax.vmap(lambda a: a.update(q))(aux_prev)
+        return aux_next, aux_next
+
+    _, aux_hist = jax.lax.scan(step, aux0, qs)
+    return aux_hist
+
+
+def _precompute_dataset_strain_bank(
+    base: dismech_jax.Rod,
+    aux0,
+    dataset: TestCase,
+) -> jax.Array:
+    """
+    Precompute all del_strains from dataset trajectories once.
+
+    Returns shape:
+        (n_samples, 5)
+    where n_samples = n_traj * n_lambda * n_triplets
+    """
+    def one_traj(qs_traj):
+        aux_hist = _build_aux_history_for_qs(aux0, qs_traj)
+        del_strain_hist = base.get_del_strain_history(qs_traj, aux_hist)
+        return del_strain_hist.reshape(-1, del_strain_hist.shape[-1])
+
+    strain_blocks = jax.vmap(one_traj)(dataset.qs)
+    return strain_blocks.reshape(-1, strain_blocks.shape[-1])
+
+
+def _spectral_loss_from_bank(
+    model: eqx.Module,
+    strain_bank: jax.Array,
+) -> jax.Array:
     penalties = jax.vmap(
-        lambda ds: spectral_spread_penalty(model.get_K_matrix(ds), max_log_spread=2.0)
-    )(del_strain_flat)
-
+        lambda ds: spectral_spread_penalty(model.get_K_matrix(ds))
+    )(strain_bank)
     return jnp.mean(penalties)
 
 
-def _trajectory_losses(
+def _trajectory_data_loss(
     model: eqx.Module,
     base: dismech_jax.Rod,
     aux,
@@ -229,13 +278,10 @@ def _trajectory_losses(
     xb_m: jax.Array,
     lambdas: jax.Array,
     truth_qs: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
+) -> jax.Array:
     bc = dismech_jax.BatchedLinearBC(idx_b=idx_b, xb_c=xb_c, xb_m=xb_m)
     rod = base.with_bc(bc)
 
-    # --------------------------
-    # 1. differentiable solve for data loss
-    # --------------------------
     pred_qs = rod.solve(
         model,
         lambdas,
@@ -245,38 +291,20 @@ def _trajectory_losses(
         ls_steps=10,
     )
 
-    data_loss = jnp.mean(jnp.square(pred_qs - truth_qs))
+    return jnp.mean(jnp.square(pred_qs - truth_qs))
 
-    # --------------------------
-    # 2. detached solve_with_aux for spectral regularizer
-    # --------------------------
-    pred_qs_aux, pred_auxs = rod.solve_with_aux(
-        jax.lax.stop_gradient(model),
-        lambdas,
-        jax.lax.stop_gradient(aux),
-        max_dlambda=5e-3,
-        iters=5,
-        ls_steps=10,
-    )
 
-    pred_qs_aux = jax.lax.stop_gradient(pred_qs_aux)
-    pred_auxs = jax.lax.stop_gradient(pred_auxs)
-
-    spec_loss = _trajectory_spectral_reg(model, rod, pred_qs_aux, pred_auxs)
-
-    return data_loss, spec_loss
-
-def _dataset_loss_terms(
+def _dataset_data_loss(
     model: eqx.Module,
     base: dismech_jax.Rod,
     aux,
     dataset: TestCase,
-) -> tuple[jax.Array, jax.Array]:
+) -> jax.Array:
     lambdas = _get_dataset_lambdas(dataset)
     idx_b_all = _get_idx_b_all(dataset)
 
-    data_losses, spec_losses = jax.vmap(
-        lambda idx_b, xb_c, xb_m, truth_qs: _trajectory_losses(
+    losses = jax.vmap(
+        lambda idx_b, xb_c, xb_m, truth_qs: _trajectory_data_loss(
             model=model,
             base=base,
             aux=aux,
@@ -288,21 +316,21 @@ def _dataset_loss_terms(
         )
     )(idx_b_all, dataset.xb_c, dataset.xb_m, dataset.qs)
 
-    return jnp.mean(data_losses), jnp.mean(spec_losses)
+    return jnp.mean(losses)
 
 
-def _dataset_loss(
+def _loss_with_aux(
     model: eqx.Module,
     base: dismech_jax.Rod,
     aux,
     dataset: TestCase,
-    alpha_spec: float = 0.0,
-) -> jax.Array:
-    """
-    Total dataset loss = data loss + alpha_spec * spectral regularization.
-    """
-    data_loss, spec_loss = _dataset_loss_terms(model, base, aux, dataset)
-    return data_loss + alpha_spec * spec_loss
+    strain_bank: jax.Array,
+    alpha_spec: float,
+) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+    data_loss = _dataset_data_loss(model, base, aux, dataset)
+    spec_loss = _spectral_loss_from_bank(model, strain_bank)
+    total_loss = data_loss + alpha_spec * spec_loss
+    return total_loss, (data_loss, spec_loss)
 
 
 def train_model(
@@ -312,19 +340,30 @@ def train_model(
     valid_file: str = "valid.npz",
     n_epochs: int = 100,
     lr: float = 1e-2,
-    init_K=jnp.array([2.0, 0.01, 0.02]),  # stretching, coupled, bending
+    init_K=jnp.array([2.0, 0.01, 0.02]),
     alpha_spec: float = 0.0,
+    spec_start_frac: float = 0.2,
+    spec_ramp_frac: float = 0.3,
 ) -> tuple:
-    validate_model(cls, init_K)
-
     base, aux, der = get_base_rod()
+    validate_model(cls, init_K)
 
     train = TestCase.from_npz(train_file)
     valid = TestCase.from_npz(valid_file)
 
-    model = cls(der_K=init_K, key=key, l_k=base.triplets.l_k[0,0])
+    # model expects l_k in your current setup
+    try:
+        model = cls(der_K=init_K, key=key, l_k=base.triplets.l_k[0, 0])
+    except TypeError:
+        model = cls(der_K=init_K, key=key)
+
     init_K = model.get_K_entries(jnp.zeros(5))
 
+    # -------- precompute spectral regularizer inputs ONCE --------
+    train_strain_bank = _precompute_dataset_strain_bank(base, aux, train)
+    valid_strain_bank = _precompute_dataset_strain_bank(base, aux, valid)
+
+    
     schedule = optax.cosine_decay_schedule(
         init_value=lr,
         decay_steps=n_epochs + 1,
@@ -339,42 +378,38 @@ def train_model(
         def train_step(carry, step_idx):
             m, s = carry
 
-            total_train_loss, grads = eqx.filter_value_and_grad(_dataset_loss)(
-                m, base, aux, train, alpha_spec
+            alpha_now = _alpha_spec_schedule(
+                step_idx=step_idx,
+                alpha_spec_max=alpha_spec,
+                start_frac=spec_start_frac,
+                ramp_frac=spec_ramp_frac,
+                num_steps=num_steps,
             )
 
-            train_data_loss, train_spec_loss = _dataset_loss_terms(
-                m, base, aux, train
-            )
+            (train_total_loss, (train_data_loss, train_spec_loss)), grads = eqx.filter_value_and_grad(
+                _loss_with_aux,
+                has_aux=True,
+            )(m, base, aux, train, train_strain_bank, alpha_now)
 
             updates, next_s = optimizer.update(grads, s, m)
             next_m = eqx.apply_updates(m, updates)
 
             is_val_step = (step_idx % val_interval) == 0
 
-            valid_total_loss = jax.lax.cond(
+            valid_total_loss, valid_data_loss, valid_spec_loss = jax.lax.cond(
                 is_val_step,
-                lambda: _dataset_loss(next_m, base, aux, valid, alpha_spec),
-                lambda: -1.0,
-            )
-
-            valid_data_loss = jax.lax.cond(
-                is_val_step,
-                lambda: _dataset_loss_terms(next_m, base, aux, valid)[0],
-                lambda: -1.0,
-            )
-
-            valid_spec_loss = jax.lax.cond(
-                is_val_step,
-                lambda: _dataset_loss_terms(next_m, base, aux, valid)[1],
-                lambda: -1.0,
+                lambda: (
+                    lambda out: (out[0], out[1][0], out[1][1])
+                )(_loss_with_aux(next_m, base, aux, valid, valid_strain_bank, alpha_now)),
+                lambda: (-1.0, -1.0, -1.0),
             )
 
             current_lr = schedule(step_idx)
 
             jax.debug.callback(
-                lambda s, lr_now, ttot, tdata, tspec, vtot, vdata, vspec, K: print(
+                lambda s, lr_now, a_now, ttot, tdata, tspec, vtot, vdata, vspec, K: print(
                     f"Step {s:<4} | LR: {lr_now:<10.3e} | "
+                    f"alpha_spec: {a_now:<10.3e} | "
                     f"TrainTot: {ttot:<12.5e} | TrainData: {tdata:<12.5e} | "
                     f"TrainSpec: {tspec:<12.5e} | "
                     f"ValidTot: {vtot:<12.5e} | ValidData: {vdata:<12.5e} | "
@@ -382,7 +417,8 @@ def train_model(
                 ) if vtot != -1.0 else None,
                 step_idx,
                 current_lr,
-                total_train_loss,
+                alpha_now,
+                train_total_loss,
                 train_data_loss,
                 train_spec_loss,
                 valid_total_loss,
@@ -392,7 +428,7 @@ def train_model(
             )
 
             return (next_m, next_s), (
-                total_train_loss,
+                train_total_loss,
                 train_data_loss,
                 train_spec_loss,
                 valid_total_loss,
