@@ -128,13 +128,17 @@ def load_problem(data_path="experiment_data/pulling_phase_data.npz", test_range=
 
 
 # =========================================================
-# 4) Prediction / training
+# 4) Prediction
 # =========================================================
 def predict_force(slinky, q0, model, disp_vals):
     def one_force(disp):
         q = slinky.get_q(disp, q0)
         return slinky.get_reaction_force(disp, q, model, None)
     return jax.vmap(one_force)(disp_vals)
+
+# =========================================================
+# 5) Training
+# =========================================================
 
 def train_one_case(
     case: CaseConfig,
@@ -157,7 +161,7 @@ def train_one_case(
     test_force_truth = force_truth[test_mask]
 
     model = make_model(case, jax.random.PRNGKey(seed))
-
+    
     def train_loss(model):
         pred_force = predict_force(slinky, q0, model, train_disps)
         return jnp.mean((train_force_truth - pred_force) ** 2)
@@ -232,7 +236,7 @@ def train_one_case(
 
 
 # =========================================================
-# 5) Plot helpers
+# 6) Plot helpers
 # =========================================================
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
@@ -418,52 +422,100 @@ def plot_test_mse_hist(results, save_path, title=None):
     fig.savefig(save_path, dpi=300)
     plt.close(fig)
 
-
 def plot_summary_panel(results, save_path, title=None):
     d = get_case_arrays(results)
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
-    ax1, ax2, ax3, ax4 = axes.ravel()
 
-    # panel 1: percentile envelope
-    ax1.fill_between(d["x"], d["q05"], d["q95"], alpha=0.18, label="5-95%")
-    ax1.fill_between(d["x"], d["q25"], d["q75"], alpha=0.30, label="25-75%")
-    ax1.plot(d["x"], d["median_curve"], "--", linewidth=2.0, label="Median")
-    ax1.plot(d["x"], d["best"]["pred_force"], linewidth=2.4, label=f"Best seed={d['best']['seed']}")
+    # =========================
+    # loss-envelope statistics
+    # =========================
+    train_hist = np.stack([r["train_hist"] for r in results], axis=0)
+    test_hist  = np.stack([r["test_hist"] for r in results], axis=0)
+    epochs = np.arange(train_hist.shape[1])
+
+    train_median = np.median(train_hist, axis=0)
+    train_p05 = np.percentile(train_hist, 5, axis=0)
+    train_p95 = np.percentile(train_hist, 95, axis=0)
+
+    test_median = np.median(test_hist, axis=0)
+    test_p05 = np.percentile(test_hist, 5, axis=0)
+    test_p95 = np.percentile(test_hist, 95, axis=0)
+
+    best = min(results, key=lambda r: r["test_mse"])
+    best_train = best["train_hist"]
+    best_test = best["test_hist"]
+
+    # =========================
+    # figure: 1 x 2
+    # =========================
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.2))
+    ax1, ax2 = axes
+
+    # -------------------------------------------------
+    # panel 1: all seed curves
+    # -------------------------------------------------
+    for r in d["results"]:
+        ax1.plot(
+            d["x"], r["pred_force"],
+            linewidth=0.9, alpha=0.15
+        )
+
+    ax1.plot(
+        d["x"], d["median_curve"],
+        "--", linewidth=2.0, label="Median"
+    )
+    ax1.plot(
+        d["x"], d["best"]["pred_force"],
+        linewidth=2.4, label=f"Best seed={d['best']['seed']}"
+    )
     add_gt(ax1, d["x"], d["y_true"], d["train_mask"], d["test_mask"])
     ax1.set_xlabel("Pulled node x")
     ax1.set_ylabel("Force")
     ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=8)
 
-    # panel 2: all seed curves
-    for r in d["results"]:
-        ax2.plot(d["x"], r["pred_force"], linewidth=0.9, alpha=0.15)
-    ax2.plot(d["x"], d["median_curve"], "--", linewidth=2.0, label="Median")
-    ax2.plot(d["x"], d["best"]["pred_force"], linewidth=2.4, label=f"Best seed={d['best']['seed']}")
-    add_gt(ax2, d["x"], d["y_true"], d["train_mask"], d["test_mask"])
-    ax2.set_xlabel("Pulled node x")
-    ax2.set_ylabel("Force")
+    # -------------------------------------------------
+    # panel 2: loss envelope
+    # -------------------------------------------------
+    ax2.fill_between(
+        epochs, train_p05, train_p95,
+        alpha=0.20, label="Train (5–95%)"
+    )
+    ax2.plot(
+        epochs, train_median,
+        linestyle="--", linewidth=2.0,
+        label="Train median"
+    )
+
+    ax2.fill_between(
+        epochs, test_p05, test_p95,
+        alpha=0.20, label="Test (5–95%)"
+    )
+    ax2.plot(
+        epochs, test_median,
+        linewidth=2.5,
+        label="Test median"
+    )
+
+    ax2.plot(
+        epochs, best_train,
+        linestyle=":", linewidth=2.0,
+        label=f"Best seed train (seed={best['seed']})"
+    )
+    ax2.plot(
+        epochs, best_test,
+        linestyle="-", linewidth=2.8,
+        label="Best seed test"
+    )
+
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("MSE loss")
+    ax2.set_yscale("log")
     ax2.grid(True, alpha=0.3)
     ax2.legend(fontsize=8)
 
-    # panel 3: variance
-    ax3.plot(d["x"], d["var_curve"], linewidth=2.3)
-    ax3.set_xlabel("Pulled node x")
-    ax3.set_ylabel("Variance across seeds")
-    ax3.grid(True, alpha=0.3)
-
-    # panel 4: histogram
-    ax4.hist(d["test_mse"], bins=15, edgecolor="black", alpha=0.8)
-    ax4.axvline(np.min(d["test_mse"]), linestyle="--", linewidth=2, label="Best")
-    ax4.axvline(np.median(d["test_mse"]), linestyle=":", linewidth=2, label="Median")
-    ax4.set_xlabel("Test MSE")
-    ax4.set_ylabel("Count")
-    ax4.grid(True, alpha=0.3)
-    ax4.legend(fontsize=8)
-
     if title is not None:
         fig.suptitle(title, fontsize=16)
-        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
     else:
         fig.tight_layout()
 
@@ -533,7 +585,7 @@ def plot_loss_envelope(results, save_path, title=None):
 
             ax.set_xlabel("Epoch")
             ax.set_ylabel("MSE loss")
-            ax.set_yscale("log")  # 🔥 important for readability
+            ax.set_yscale("log")  # important for readability
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=9)
 
