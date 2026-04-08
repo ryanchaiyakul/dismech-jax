@@ -612,7 +612,7 @@ def plot_summary_bars(summary_rows, save_path, title=None):
 # 8) Main driver
 # =========================================================
 def main():
-    out_root = "ablation_outputs"
+    out_root = "ablation_outputs_old"
     case_outdir = os.path.join(out_root, "cases")
     fig_outdir = os.path.join(out_root, "figures")
     ensure_dir(case_outdir)

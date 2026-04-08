@@ -17,3 +17,10 @@ util
 
 # results and logs
 examples/slinky/slinky_1D/ablation_outputs/
+
+# Ignore specific files in the ablation_outputs directory
+*.json
+*.png
+*.npz
+*.pdf
+*.eqx
