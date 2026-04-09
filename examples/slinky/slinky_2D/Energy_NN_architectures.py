@@ -1,9 +1,6 @@
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-from jaxtyping import Float
-
-from util import TripletModel
 
 
 # ===================================================================================== #
@@ -82,7 +79,7 @@ def _vec_to_L(p: jax.Array) -> jax.Array:
 # ===================================================================================== #
 class ScalarMLP(eqx.Module):
     layers: tuple[eqx.nn.Linear, ...]
-    positive_output: bool
+    positive_output: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -112,7 +109,7 @@ class ScalarICNN(eqx.Module):
     z_layers: tuple[eqx.nn.Linear, ...]
     final_x: eqx.nn.Linear
     final_z: eqx.nn.Linear
-    positive_output: bool
+    positive_output: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -163,7 +160,7 @@ class ScalarICNN(eqx.Module):
 
 
 class VectorNet(eqx.Module):
-    heads: tuple[eqx.Module, ...]
+    heads: tuple
 
     def __init__(
         self,
@@ -189,16 +186,19 @@ class VectorNet(eqx.Module):
 # ===================================================================================== #
 # Shared mixins
 # ===================================================================================== #
-class _DiagonalBase(eqx.Module):
+class _DiagonalBase:
     K0_raw: jax.Array
 
-    def _init_diag(self, der_K: jax.Array):
-        self.K0_raw = _init_diag_raw(der_K)
+    @staticmethod
+    def _init_diag(der_K: jax.Array) -> jax.Array:
+        return _init_diag_raw(der_K)
 
     def get_K0(self) -> jax.Array:
         return jax.nn.softplus(self.K0_raw)
 
-    def _diag_energy_from_entries(self, k_s: jax.Array, k_b: jax.Array, del_strain: jax.Array) -> jax.Array:
+    def _diag_energy_from_entries(
+        self, k_s: jax.Array, k_b: jax.Array, del_strain: jax.Array
+    ) -> jax.Array:
         e0, e1, eb = get_reduced_strain_features(del_strain)
         return 0.5 * k_s * (e0**2 + e1**2) + 0.5 * k_b * eb**2
 
@@ -210,11 +210,12 @@ class _DiagonalBase(eqx.Module):
         ])
 
 
-class _CholeskyBase(eqx.Module):
+class _CholeskyBase:
     K0_raw: jax.Array
 
-    def _init_cholesky(self, der_K: jax.Array):
-        self.K0_raw = _init_cholesky_raw(der_K)
+    @staticmethod
+    def _init_cholesky(der_K: jax.Array) -> jax.Array:
+        return _init_cholesky_raw(der_K)
 
     def get_B0(self) -> jax.Array:
         L0 = _vec_to_L(self.K0_raw)
@@ -235,7 +236,9 @@ class _CholeskyBase(eqx.Module):
             [k_sb, k_sb, k_bb],
         ])
 
-    def _chol_energy_from_entries(self, k_ss: jax.Array, k_sb: jax.Array, k_bb: jax.Array, del_strain: jax.Array) -> jax.Array:
+    def _chol_energy_from_entries(
+        self, k_ss: jax.Array, k_sb: jax.Array, k_bb: jax.Array, del_strain: jax.Array
+    ) -> jax.Array:
         e0, e1, eb = get_reduced_strain_features(del_strain)
         return (
             0.5 * k_ss * (e0**2 + e1**2)
@@ -247,16 +250,23 @@ class _CholeskyBase(eqx.Module):
 # ===================================================================================== #
 # 1) DiagonalPlusEnergyNN
 # ===================================================================================== #
-class DiagonalPlusEnergyNN(TripletModel, _DiagonalBase):
+class DiagonalPlusEnergyNN(eqx.Module, _DiagonalBase):
+    K0_raw: jax.Array
     mlp: ScalarMLP
     icnn: ScalarICNN
-    which_case: str
-    zero_reference: bool
+    which_case: str = eqx.field(static=True)
+    zero_reference: bool = eqx.field(static=True)
 
-    def __init__(self, der_K: jax.Array, key: jax.Array, hidden: tuple[int, ...] = (10,),
-                 which_case: str = "baseline", zero_reference: bool = True):
+    def __init__(
+        self,
+        der_K: jax.Array,
+        key: jax.Array,
+        hidden: tuple[int, ...] = (10,),
+        which_case: str = "baseline",
+        zero_reference: bool = True,
+    ):
         k1, k2 = jax.random.split(key, 2)
-        self._init_diag(der_K)
+        self.K0_raw = self._init_diag(der_K)
         self.mlp = ScalarMLP(2, hidden, k1, positive_output=True)
         self.icnn = ScalarICNN(2, hidden, k2, positive_output=True)
         self.which_case = which_case
@@ -274,7 +284,7 @@ class DiagonalPlusEnergyNN(TripletModel, _DiagonalBase):
             out = out - net(jnp.zeros_like(x))
         return out
 
-    def __call__(self, del_strain: Float[jax.Array, "..."]) -> Float[jax.Array, ""]:
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
         if self.which_case == "baseline":
             return self.baseline_energy(del_strain)
         if self.which_case in ("MLP", "ICNN"):
@@ -285,16 +295,23 @@ class DiagonalPlusEnergyNN(TripletModel, _DiagonalBase):
 # ===================================================================================== #
 # 2) CholeskyPlusEnergyNN
 # ===================================================================================== #
-class CholeskyPlusEnergyNN(TripletModel, _CholeskyBase):
+class CholeskyPlusEnergyNN(eqx.Module, _CholeskyBase):
+    K0_raw: jax.Array
     mlp: ScalarMLP
     icnn: ScalarICNN
-    which_case: str
-    zero_reference: bool
+    which_case: str = eqx.field(static=True)
+    zero_reference: bool = eqx.field(static=True)
 
-    def __init__(self, der_K: jax.Array, key: jax.Array, hidden: tuple[int, ...] = (10,),
-                 which_case: str = "baseline", zero_reference: bool = True):
+    def __init__(
+        self,
+        der_K: jax.Array,
+        key: jax.Array,
+        hidden: tuple[int, ...] = (10,),
+        which_case: str = "baseline",
+        zero_reference: bool = True,
+    ):
         k1, k2 = jax.random.split(key, 2)
-        self._init_cholesky(der_K)
+        self.K0_raw = self._init_cholesky(der_K)
         self.mlp = ScalarMLP(2, hidden, k1, positive_output=True)
         self.icnn = ScalarICNN(2, hidden, k2, positive_output=True)
         self.which_case = which_case
@@ -319,7 +336,7 @@ class CholeskyPlusEnergyNN(TripletModel, _CholeskyBase):
             out = out - net(jnp.zeros_like(x))
         return out
 
-    def __call__(self, del_strain: Float[jax.Array, "..."]) -> Float[jax.Array, ""]:
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
         if self.which_case == "baseline":
             return self.baseline_energy(del_strain)
         if self.which_case in ("MLP", "ICNN"):
@@ -330,15 +347,21 @@ class CholeskyPlusEnergyNN(TripletModel, _CholeskyBase):
 # ===================================================================================== #
 # 3) DiagonalPlusStiffnessNN  (PSD)
 # ===================================================================================== #
-class DiagonalPlusStiffnessNN(TripletModel, _DiagonalBase):
+class DiagonalPlusStiffnessNN(eqx.Module, _DiagonalBase):
+    K0_raw: jax.Array
     mlp: VectorNet
     icnn: VectorNet
-    which_case: str
+    which_case: str = eqx.field(static=True)
 
-    def __init__(self, der_K: jax.Array, key: jax.Array, hidden: tuple[int, ...] = (10,),
-                 which_case: str = "MLP"):
+    def __init__(
+        self,
+        der_K: jax.Array,
+        key: jax.Array,
+        hidden: tuple[int, ...] = (10,),
+        which_case: str = "MLP",
+    ):
         k1, k2 = jax.random.split(key, 2)
-        self._init_diag(der_K)
+        self.K0_raw = self._init_diag(der_K)
         self.mlp = VectorNet("MLP", 2, hidden, 2, k1, positive_output=False)
         self.icnn = VectorNet("ICNN", 2, hidden, 2, k2, positive_output=False)
         self.which_case = which_case
@@ -355,7 +378,7 @@ class DiagonalPlusStiffnessNN(TripletModel, _DiagonalBase):
         k_s, k_b = self.get_K_total(del_strain)
         return self._diag_matrix(k_s, k_b)
 
-    def __call__(self, del_strain: Float[jax.Array, "..."]) -> Float[jax.Array, ""]:
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
         k_s, k_b = self.get_K_total(del_strain)
         return self._diag_energy_from_entries(k_s, k_b, del_strain)
 
@@ -363,15 +386,21 @@ class DiagonalPlusStiffnessNN(TripletModel, _DiagonalBase):
 # ===================================================================================== #
 # 4) CholeskyPlusStiffnessNN  (PSD)
 # ===================================================================================== #
-class CholeskyPlusStiffnessNN(TripletModel, _CholeskyBase):
+class CholeskyPlusStiffnessNN(eqx.Module, _CholeskyBase):
+    K0_raw: jax.Array
     mlp: VectorNet
     icnn: VectorNet
-    which_case: str
+    which_case: str = eqx.field(static=True)
 
-    def __init__(self, der_K: jax.Array, key: jax.Array, hidden: tuple[int, ...] = (10,),
-                 which_case: str = "MLP"):
+    def __init__(
+        self,
+        der_K: jax.Array,
+        key: jax.Array,
+        hidden: tuple[int, ...] = (10,),
+        which_case: str = "MLP",
+    ):
         k1, k2 = jax.random.split(key, 2)
-        self._init_cholesky(der_K)
+        self.K0_raw = self._init_cholesky(der_K)
         self.mlp = VectorNet("MLP", 2, hidden, 3, k1, positive_output=False)
         self.icnn = VectorNet("ICNN", 2, hidden, 3, k2, positive_output=False)
         self.which_case = which_case
@@ -392,7 +421,7 @@ class CholeskyPlusStiffnessNN(TripletModel, _CholeskyBase):
         k_ss, k_sb, k_bb = self.get_K_entries(del_strain)
         return self._entries_to_matrix(k_ss, k_sb, k_bb)
 
-    def __call__(self, del_strain: Float[jax.Array, "..."]) -> Float[jax.Array, ""]:
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
         k_ss, k_sb, k_bb = self.get_K_entries(del_strain)
         return self._chol_energy_from_entries(k_ss, k_sb, k_bb, del_strain)
 
@@ -400,15 +429,21 @@ class CholeskyPlusStiffnessNN(TripletModel, _CholeskyBase):
 # ===================================================================================== #
 # 5) CholeskyPlusStiffnessSignedNN  (signed raw-parameter correction, PSD-guaranteed)
 # ===================================================================================== #
-class CholeskyPlusStiffnessSignedNN(TripletModel, _CholeskyBase):
+class CholeskyPlusStiffnessSignedNN(eqx.Module, _CholeskyBase):
+    K0_raw: jax.Array
     mlp: VectorNet
     icnn: VectorNet
-    which_case: str
+    which_case: str = eqx.field(static=True)
 
-    def __init__(self, der_K: jax.Array, key: jax.Array, hidden: tuple[int, ...] = (10,),
-                 which_case: str = "MLP"):
+    def __init__(
+        self,
+        der_K: jax.Array,
+        key: jax.Array,
+        hidden: tuple[int, ...] = (10,),
+        which_case: str = "MLP",
+    ):
         k1, k2 = jax.random.split(key, 2)
-        self._init_cholesky(der_K)
+        self.K0_raw = self._init_cholesky(der_K)
         self.mlp = VectorNet("MLP", 2, hidden, 3, k1, positive_output=False)
         self.icnn = VectorNet("ICNN", 2, hidden, 3, k2, positive_output=False)
         self.which_case = which_case
@@ -426,6 +461,6 @@ class CholeskyPlusStiffnessSignedNN(TripletModel, _CholeskyBase):
         k_ss, k_sb, k_bb = self.get_K_entries(del_strain)
         return self._entries_to_matrix(k_ss, k_sb, k_bb)
 
-    def __call__(self, del_strain: Float[jax.Array, "..."]) -> Float[jax.Array, ""]:
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
         k_ss, k_sb, k_bb = self.get_K_entries(del_strain)
         return self._chol_energy_from_entries(k_ss, k_sb, k_bb, del_strain)
