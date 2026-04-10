@@ -5,7 +5,7 @@ import optax
 import numpy as np
 import dismech_jax as djx
 
-
+from Energy_NN_architectures import ModelParams
 # =========================================================
 # Dataset (ONLY direct BC)
 # =========================================================
@@ -47,6 +47,14 @@ def get_slinky():
     rod = eqx.tree_at(lambda r: r.E_ext, rod, djx.Gravity(f))
     return rod, aux
 
+# =========================================================
+# Predict
+# =========================================================
+def predict(model, base, aux, idx_b, xb, lambdas):
+    bc = djx.BatchedDirectBC(idx_b=idx_b, xb=xb, lambdas=lambdas)
+    rod = base.with_bc(bc)
+    pred = rod.solve(model, lambdas, aux, max_dlambda=5e-3, iters=5, ls_steps=10)
+    return pred
 
 # =========================================================
 # Loss (MSE over trajectories)
@@ -82,21 +90,26 @@ def dataset_loss(model, base, aux, data: Dataset):
 # =========================================================
 def train_model(
     model_cls,
+    params: ModelParams,
     train_file,
     valid_file,
-    key=jax.random.PRNGKey(0),
     n_epochs=100,
-    lr=1e-3,
-    init_K=jnp.array([2.0, 0.01, 0.02]),
+    lr=1e-2,
 ):
     # --- setup ---
     base, aux = get_slinky()
     train = Dataset.load(train_file)
     valid = Dataset.load(valid_file)
 
-    model = model_cls(der_K=init_K, key=key)
+    model = model_cls(params)
 
-    opt = optax.adam(lr)
+    schedule = optax.cosine_decay_schedule(
+        init_value=lr,
+        decay_steps=n_epochs + 1,
+        alpha=0.1,
+    )
+
+    opt = optax.adam(schedule)
     opt_state = opt.init(model)
 
     # --- training step ---

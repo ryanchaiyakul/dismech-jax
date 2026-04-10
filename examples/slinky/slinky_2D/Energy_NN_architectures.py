@@ -10,7 +10,9 @@ def inv_softplus(y: jax.Array) -> jax.Array:
     return jnp.log(jnp.expm1(y))
 
 
-def get_reduced_strain_features(del_strain: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+def get_reduced_strain_features(
+    del_strain: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     del_strain = jnp.ravel(del_strain)
     if del_strain.shape[0] < 4:
         raise ValueError(
@@ -22,9 +24,23 @@ def get_reduced_strain_features(del_strain: jax.Array) -> tuple[jax.Array, jax.A
     return e0, e1, eb
 
 
-def get_nn_input_from_strain(del_strain: jax.Array) -> jax.Array:
+def get_nn_input(del_strain: jax.Array, input_mode: str) -> jax.Array:
     e0, e1, eb = get_reduced_strain_features(del_strain)
-    return jnp.array([e0**2 + e1**2, eb**2])
+
+    if input_mode == "invariant":
+        return jnp.array([e0**2 + e1**2, eb**2])
+    if input_mode == "raw":
+        return jnp.array([e0, e1, eb])
+
+    raise ValueError("input_mode must be 'invariant' or 'raw'")
+
+
+def _nn_in_features(input_mode: str) -> int:
+    if input_mode == "invariant":
+        return 2
+    if input_mode == "raw":
+        return 3
+    raise ValueError("input_mode must be 'invariant' or 'raw'")
 
 
 def _small_linear(in_features: int, out_features: int, key: jax.Array) -> eqx.nn.Linear:
@@ -58,20 +74,38 @@ def _init_cholesky_raw(der_K: jax.Array) -> jax.Array:
     rem = k_bb0 - l21**2
     l22 = jnp.sqrt(jnp.maximum(rem, eps))
 
-    return jnp.array([
-        inv_softplus(l11 - eps),
-        l21,
-        inv_softplus(l22 - eps),
-    ])
+    return jnp.array(
+        [
+            inv_softplus(l11 - eps),
+            l21,
+            inv_softplus(l22 - eps),
+        ]
+    )
 
 
 def _vec_to_L(p: jax.Array) -> jax.Array:
     eps = 1e-6
     p = jnp.ravel(p)
-    return jnp.array([
-        [jax.nn.softplus(p[0]) + eps, 0.0],
-        [p[1],                        jax.nn.softplus(p[2]) + eps],
-    ])
+    return jnp.array(
+        [
+            [jax.nn.softplus(p[0]) + eps, 0.0],
+            [p[1], jax.nn.softplus(p[2]) + eps],
+        ]
+    )
+
+
+# ===================================================================================== #
+# Model params
+# ===================================================================================== #
+class ModelParams(eqx.Module):
+    der_K: jax.Array
+    key: jax.Array
+
+    hidden: tuple[int, ...] = eqx.field(static=True, default=(10,))
+    which_case: str = eqx.field(static=True, default="MLP")
+    corr_factor: float = eqx.field(static=True, default=1.0)
+    input_mode: str = eqx.field(static=True, default="raw")
+    zero_reference: bool = eqx.field(static=True, default=True)
 
 
 # ===================================================================================== #
@@ -92,7 +126,8 @@ class ScalarMLP(eqx.Module):
         sizes = (in_features, *hidden, 1)
         keys = jax.random.split(key, len(sizes) - 1)
         self.layers = tuple(
-            _small_linear(sizes[i], sizes[i + 1], keys[i]) for i in range(len(sizes) - 1)
+            _small_linear(sizes[i], sizes[i + 1], keys[i])
+            for i in range(len(sizes) - 1)
         )
         self.positive_output = positive_output
 
@@ -140,7 +175,8 @@ class ScalarICNN(eqx.Module):
 
         self.x_layers = tuple(x_layers)
         self.z_layers = tuple(z_layers)
-        self.final_x = _small_linear(in_features, 1, keys[k]); k += 1
+        self.final_x = _small_linear(in_features, 1, keys[k])
+        k += 1
         self.final_z = _small_linear(hidden[-1], 1, keys[k])
         self.positive_output = positive_output
 
@@ -159,8 +195,95 @@ class ScalarICNN(eqx.Module):
         return jax.nn.softplus(y) if self.positive_output else y
 
 
+# ===================================================================================== #
+# Shared vector nets
+# ===================================================================================== #
+class VectorMLP(eqx.Module):
+    layers: tuple[eqx.nn.Linear, ...]
+    positive_output: bool = eqx.field(static=True)
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden: tuple[int, ...],
+        out_features: int,
+        key: jax.Array,
+        *,
+        positive_output: bool,
+    ):
+        sizes = (in_features, *hidden, out_features)
+        keys = jax.random.split(key, len(sizes) - 1)
+        self.layers = tuple(
+            _small_linear(sizes[i], sizes[i + 1], keys[i])
+            for i in range(len(sizes) - 1)
+        )
+        self.positive_output = positive_output
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = jnp.ravel(x)
+        for layer in self.layers[:-1]:
+            x = jax.nn.softplus(layer(x))
+        y = self.layers[-1](x)
+        return jax.nn.softplus(y) if self.positive_output else y
+
+
+class VectorICNN(eqx.Module):
+    x_layers: tuple[eqx.nn.Linear, ...]
+    z_layers: tuple[eqx.nn.Linear, ...]
+    final_x: eqx.nn.Linear
+    final_z: eqx.nn.Linear
+    positive_output: bool = eqx.field(static=True)
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden: tuple[int, ...],
+        out_features: int,
+        key: jax.Array,
+        *,
+        positive_output: bool,
+    ):
+        if len(hidden) == 0:
+            raise ValueError("hidden must contain at least one hidden layer.")
+
+        n_x = len(hidden)
+        n_z = len(hidden) - 1
+        n_total = n_x + n_z + 2
+        keys = jax.random.split(key, n_total)
+
+        k = 0
+        x_layers = []
+        for h in hidden:
+            x_layers.append(_small_linear(in_features, h, keys[k]))
+            k += 1
+
+        z_layers = []
+        for h_in, h_out in zip(hidden[:-1], hidden[1:]):
+            z_layers.append(_small_linear(h_in, h_out, keys[k]))
+            k += 1
+
+        self.x_layers = tuple(x_layers)
+        self.z_layers = tuple(z_layers)
+        self.final_x = _small_linear(in_features, out_features, keys[k]); k += 1
+        self.final_z = _small_linear(hidden[-1], out_features, keys[k])
+        self.positive_output = positive_output
+
+    @staticmethod
+    def _positive_linear(layer: eqx.nn.Linear, x: jax.Array) -> jax.Array:
+        w_pos = jax.nn.softplus(layer.weight)
+        return w_pos @ x + layer.bias
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = jnp.ravel(x)
+        z = jax.nn.softplus(self.x_layers[0](x))
+        for x_layer, z_layer in zip(self.x_layers[1:], self.z_layers):
+            z = jax.nn.softplus(self._positive_linear(z_layer, z) + x_layer(x))
+        y = self._positive_linear(self.final_z, z) + self.final_x(x)
+        return jax.nn.softplus(y) if self.positive_output else y
+
+
 class VectorNet(eqx.Module):
-    heads: tuple
+    net: eqx.Module
 
     def __init__(
         self,
@@ -172,19 +295,31 @@ class VectorNet(eqx.Module):
         *,
         positive_output: bool,
     ):
-        keys = jax.random.split(key, out_features)
-        head_cls = ScalarMLP if net_type == "MLP" else ScalarICNN
-        self.heads = tuple(
-            head_cls(in_features, hidden, k, positive_output=positive_output) for k in keys
-        )
+        if net_type == "MLP":
+            self.net = VectorMLP(
+                in_features=in_features,
+                hidden=hidden,
+                out_features=out_features,
+                key=key,
+                positive_output=positive_output,
+            )
+        elif net_type == "ICNN":
+            self.net = VectorICNN(
+                in_features=in_features,
+                hidden=hidden,
+                out_features=out_features,
+                key=key,
+                positive_output=positive_output,
+            )
+        else:
+            raise ValueError("net_type must be 'MLP' or 'ICNN'.")
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = jnp.ravel(x)
-        return jnp.array([head(x) for head in self.heads])
+        return self.net(x)
 
 
 # ===================================================================================== #
-# Shared mixins
+# Shared bases
 # ===================================================================================== #
 class _DiagonalBase:
     K0_raw: jax.Array
@@ -203,11 +338,13 @@ class _DiagonalBase:
         return 0.5 * k_s * (e0**2 + e1**2) + 0.5 * k_b * eb**2
 
     def _diag_matrix(self, k_s: jax.Array, k_b: jax.Array) -> jax.Array:
-        return jnp.array([
-            [k_s, 0.0, 0.0],
-            [0.0, k_s, 0.0],
-            [0.0, 0.0, k_b],
-        ])
+        return jnp.array(
+            [
+                [k_s, 0.0, 0.0],
+                [0.0, k_s, 0.0],
+                [0.0, 0.0, k_b],
+            ]
+        )
 
 
 class _CholeskyBase:
@@ -229,15 +366,23 @@ class _CholeskyBase:
         return jnp.array([k_ss, k_sb, k_bb])
 
     @staticmethod
-    def _entries_to_matrix(k_ss: jax.Array, k_sb: jax.Array, k_bb: jax.Array) -> jax.Array:
-        return jnp.array([
-            [k_ss, 0.0,  k_sb],
-            [0.0,  k_ss, k_sb],
-            [k_sb, k_sb, k_bb],
-        ])
+    def _entries_to_matrix(
+        k_ss: jax.Array, k_sb: jax.Array, k_bb: jax.Array
+    ) -> jax.Array:
+        return jnp.array(
+            [
+                [k_ss, 0.0, k_sb],
+                [0.0, k_ss, k_sb],
+                [k_sb, k_sb, k_bb],
+            ]
+        )
 
     def _chol_energy_from_entries(
-        self, k_ss: jax.Array, k_sb: jax.Array, k_bb: jax.Array, del_strain: jax.Array
+        self,
+        k_ss: jax.Array,
+        k_sb: jax.Array,
+        k_bb: jax.Array,
+        del_strain: jax.Array,
     ) -> jax.Array:
         e0, e1, eb = get_reduced_strain_features(del_strain)
         return (
@@ -256,33 +401,32 @@ class DiagonalPlusEnergyNN(eqx.Module, _DiagonalBase):
     icnn: ScalarICNN
     which_case: str = eqx.field(static=True)
     zero_reference: bool = eqx.field(static=True)
+    corr_factor: float = eqx.field(static=True)
+    input_mode: str = eqx.field(static=True)
 
-    def __init__(
-        self,
-        der_K: jax.Array,
-        key: jax.Array,
-        hidden: tuple[int, ...] = (10,),
-        which_case: str = "baseline",
-        zero_reference: bool = True,
-    ):
-        k1, k2 = jax.random.split(key, 2)
-        self.K0_raw = self._init_diag(der_K)
-        self.mlp = ScalarMLP(2, hidden, k1, positive_output=True)
-        self.icnn = ScalarICNN(2, hidden, k2, positive_output=True)
-        self.which_case = which_case
-        self.zero_reference = zero_reference
+    def __init__(self, params: ModelParams):
+        k1, k2 = jax.random.split(params.key, 2)
+        in_features = _nn_in_features(params.input_mode)
+
+        self.K0_raw = self._init_diag(params.der_K)
+        self.mlp = ScalarMLP(in_features, params.hidden, k1, positive_output=True)
+        self.icnn = ScalarICNN(in_features, params.hidden, k2, positive_output=True)
+        self.which_case = params.which_case
+        self.zero_reference = params.zero_reference
+        self.corr_factor = params.corr_factor
+        self.input_mode = params.input_mode
 
     def baseline_energy(self, del_strain: jax.Array) -> jax.Array:
         k_s, k_b = self.get_K0()
         return self._diag_energy_from_entries(k_s, k_b, del_strain)
 
     def correction_energy(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input_from_strain(del_strain)
+        x = get_nn_input(del_strain, self.input_mode)
         net = self.mlp if self.which_case == "MLP" else self.icnn
         out = net(x)
         if self.zero_reference:
             out = out - net(jnp.zeros_like(x))
-        return out
+        return self.corr_factor * out
 
     def __call__(self, del_strain: jax.Array) -> jax.Array:
         if self.which_case == "baseline":
@@ -301,21 +445,20 @@ class CholeskyPlusEnergyNN(eqx.Module, _CholeskyBase):
     icnn: ScalarICNN
     which_case: str = eqx.field(static=True)
     zero_reference: bool = eqx.field(static=True)
+    corr_factor: float = eqx.field(static=True)
+    input_mode: str = eqx.field(static=True)
 
-    def __init__(
-        self,
-        der_K: jax.Array,
-        key: jax.Array,
-        hidden: tuple[int, ...] = (10,),
-        which_case: str = "baseline",
-        zero_reference: bool = True,
-    ):
-        k1, k2 = jax.random.split(key, 2)
-        self.K0_raw = self._init_cholesky(der_K)
-        self.mlp = ScalarMLP(2, hidden, k1, positive_output=True)
-        self.icnn = ScalarICNN(2, hidden, k2, positive_output=True)
-        self.which_case = which_case
-        self.zero_reference = zero_reference
+    def __init__(self, params: ModelParams):
+        k1, k2 = jax.random.split(params.key, 2)
+        in_features = _nn_in_features(params.input_mode)
+
+        self.K0_raw = self._init_cholesky(params.der_K)
+        self.mlp = ScalarMLP(in_features, params.hidden, k1, positive_output=True)
+        self.icnn = ScalarICNN(in_features, params.hidden, k2, positive_output=True)
+        self.which_case = params.which_case
+        self.zero_reference = params.zero_reference
+        self.corr_factor = params.corr_factor
+        self.input_mode = params.input_mode
 
     def get_K_entries(self) -> jax.Array:
         return self._B_to_entries(self.get_B0())
@@ -329,12 +472,12 @@ class CholeskyPlusEnergyNN(eqx.Module, _CholeskyBase):
         return self._chol_energy_from_entries(k_ss, k_sb, k_bb, del_strain)
 
     def correction_energy(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input_from_strain(del_strain)
+        x = get_nn_input(del_strain, self.input_mode)
         net = self.mlp if self.which_case == "MLP" else self.icnn
         out = net(x)
         if self.zero_reference:
             out = out - net(jnp.zeros_like(x))
-        return out
+        return self.corr_factor * out
 
     def __call__(self, del_strain: jax.Array) -> jax.Array:
         if self.which_case == "baseline":
@@ -352,24 +495,28 @@ class DiagonalPlusStiffnessNN(eqx.Module, _DiagonalBase):
     mlp: VectorNet
     icnn: VectorNet
     which_case: str = eqx.field(static=True)
+    corr_factor: float = eqx.field(static=True)
+    input_mode: str = eqx.field(static=True)
 
-    def __init__(
-        self,
-        der_K: jax.Array,
-        key: jax.Array,
-        hidden: tuple[int, ...] = (10,),
-        which_case: str = "MLP",
-    ):
-        k1, k2 = jax.random.split(key, 2)
-        self.K0_raw = self._init_diag(der_K)
-        self.mlp = VectorNet("MLP", 2, hidden, 2, k1, positive_output=False)
-        self.icnn = VectorNet("ICNN", 2, hidden, 2, k2, positive_output=False)
-        self.which_case = which_case
+    def __init__(self, params: ModelParams):
+        k1, k2 = jax.random.split(params.key, 2)
+        in_features = _nn_in_features(params.input_mode)
+
+        self.K0_raw = self._init_diag(params.der_K)
+        self.mlp = VectorNet(
+            "MLP", in_features, params.hidden, 2, k1, positive_output=False
+        )
+        self.icnn = VectorNet(
+            "ICNN", in_features, params.hidden, 2, k2, positive_output=False
+        )
+        self.which_case = params.which_case
+        self.corr_factor = params.corr_factor
+        self.input_mode = params.input_mode
 
     def get_K_correction(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input_from_strain(del_strain)
+        x = get_nn_input(del_strain, self.input_mode)
         raw = self.mlp(x) if self.which_case == "MLP" else self.icnn(x)
-        return jax.nn.softplus(raw)
+        return jax.nn.softplus(self.corr_factor * raw)
 
     def get_K_total(self, del_strain: jax.Array) -> jax.Array:
         return self.get_K0() + self.get_K_correction(del_strain)
@@ -391,24 +538,28 @@ class CholeskyPlusStiffnessNN(eqx.Module, _CholeskyBase):
     mlp: VectorNet
     icnn: VectorNet
     which_case: str = eqx.field(static=True)
+    corr_factor: float = eqx.field(static=True)
+    input_mode: str = eqx.field(static=True)
 
-    def __init__(
-        self,
-        der_K: jax.Array,
-        key: jax.Array,
-        hidden: tuple[int, ...] = (10,),
-        which_case: str = "MLP",
-    ):
-        k1, k2 = jax.random.split(key, 2)
-        self.K0_raw = self._init_cholesky(der_K)
-        self.mlp = VectorNet("MLP", 2, hidden, 3, k1, positive_output=False)
-        self.icnn = VectorNet("ICNN", 2, hidden, 3, k2, positive_output=False)
-        self.which_case = which_case
+    def __init__(self, params: ModelParams):
+        k1, k2 = jax.random.split(params.key, 2)
+        in_features = _nn_in_features(params.input_mode)
+
+        self.K0_raw = self._init_cholesky(params.der_K)
+        self.mlp = VectorNet(
+            "MLP", in_features, params.hidden, 3, k1, positive_output=False
+        )
+        self.icnn = VectorNet(
+            "ICNN", in_features, params.hidden, 3, k2, positive_output=False
+        )
+        self.which_case = params.which_case
+        self.corr_factor = params.corr_factor
+        self.input_mode = params.input_mode
 
     def get_Bnn(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input_from_strain(del_strain)
+        x = get_nn_input(del_strain, self.input_mode)
         p = self.mlp(x) if self.which_case == "MLP" else self.icnn(x)
-        L = _vec_to_L(p)
+        L = _vec_to_L(self.corr_factor * p)
         return L @ L.T
 
     def get_B_total(self, del_strain: jax.Array) -> jax.Array:
@@ -434,24 +585,100 @@ class CholeskyPlusStiffnessSignedNN(eqx.Module, _CholeskyBase):
     mlp: VectorNet
     icnn: VectorNet
     which_case: str = eqx.field(static=True)
+    corr_factor: float = eqx.field(static=True)
+    input_mode: str = eqx.field(static=True)
+
+    def __init__(self, params: ModelParams):
+        k1, k2 = jax.random.split(params.key, 2)
+        in_features = _nn_in_features(params.input_mode)
+
+        self.K0_raw = self._init_cholesky(params.der_K)
+        self.mlp = VectorNet(
+            "MLP", in_features, params.hidden, 3, k1, positive_output=False
+        )
+        self.icnn = VectorNet(
+            "ICNN", in_features, params.hidden, 3, k2, positive_output=False
+        )
+        self.which_case = params.which_case
+        self.corr_factor = params.corr_factor
+        self.input_mode = params.input_mode
+
+    def get_B_total(self, del_strain: jax.Array) -> jax.Array:
+        x = get_nn_input(del_strain, self.input_mode)
+        dp = self.mlp(x) if self.which_case == "MLP" else self.icnn(x)
+        L = _vec_to_L(self.K0_raw + self.corr_factor * dp)
+        return L @ L.T
+
+    def get_K_entries(self, del_strain: jax.Array) -> jax.Array:
+        return self._B_to_entries(self.get_B_total(del_strain))
+
+    def get_K_matrix(self, del_strain: jax.Array) -> jax.Array:
+        k_ss, k_sb, k_bb = self.get_K_entries(del_strain)
+        return self._entries_to_matrix(k_ss, k_sb, k_bb)
+
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
+        k_ss, k_sb, k_bb = self.get_K_entries(del_strain)
+        return self._chol_energy_from_entries(k_ss, k_sb, k_bb, del_strain)
+
+### matching architecture to previos good ones:
+class VectorMLPTanh(eqx.Module):
+    layer1: eqx.nn.Linear
+    layer2: eqx.nn.Linear
 
     def __init__(
         self,
-        der_K: jax.Array,
+        in_features: int,
+        hidden: tuple[int, ...],
+        out_features: int,
         key: jax.Array,
-        hidden: tuple[int, ...] = (10,),
-        which_case: str = "MLP",
     ):
-        k1, k2 = jax.random.split(key, 2)
-        self.K0_raw = self._init_cholesky(der_K)
-        self.mlp = VectorNet("MLP", 2, hidden, 3, k1, positive_output=False)
-        self.icnn = VectorNet("ICNN", 2, hidden, 3, k2, positive_output=False)
-        self.which_case = which_case
+        if len(hidden) != 1:
+            raise ValueError(
+                f"VectorMLPTanh expects exactly one hidden layer, got hidden={hidden}"
+            )
+
+        hidden_size = hidden[0]
+        key1, key2 = jax.random.split(key, 2)
+
+        self.layer1 = eqx.nn.Linear(in_features, hidden_size, key=key1)
+        self.layer2 = eqx.nn.Linear(hidden_size, out_features, key=key2)
+
+        self.layer1 = eqx.tree_at(
+            lambda l: l.weight, self.layer1, self.layer1.weight * 1e-2
+        )
+        self.layer2 = eqx.tree_at(
+            lambda l: l.weight, self.layer2, self.layer2.weight * 1e-2
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = jnp.ravel(x)
+        x = jax.nn.tanh(self.layer1(x))
+        x = self.layer2(x)
+        return x
+
+class CholeskyPlusStiffnessSignedMLPTanhExact(eqx.Module, _CholeskyBase):
+    K0_raw: jax.Array
+    mlp: VectorMLPTanh
+    corr_factor: float = eqx.field(static=True)
+    input_mode: str = eqx.field(static=True)
+
+    def __init__(self, params: ModelParams):
+        in_features = _nn_in_features(params.input_mode)
+
+        self.K0_raw = self._init_cholesky(params.der_K)
+        self.mlp = VectorMLPTanh(
+            in_features=in_features,
+            hidden=params.hidden,
+            out_features=3,
+            key=params.key,
+        )
+        self.corr_factor = params.corr_factor
+        self.input_mode = params.input_mode
 
     def get_B_total(self, del_strain: jax.Array) -> jax.Array:
-        x = get_nn_input_from_strain(del_strain)
-        dp = self.mlp(x) if self.which_case == "MLP" else self.icnn(x)
-        L = _vec_to_L(self.K0_raw + dp)
+        x = get_nn_input(del_strain, self.input_mode)
+        dp = self.mlp(x)
+        L = _vec_to_L(self.K0_raw + self.corr_factor * dp)
         return L @ L.T
 
     def get_K_entries(self, del_strain: jax.Array) -> jax.Array:

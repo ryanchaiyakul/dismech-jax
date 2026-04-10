@@ -62,16 +62,24 @@ class DirectBC(AbstractBC):
     lambdas: jax.Array
 
     def apply(self, q: jax.Array, _lambda: jax.Array) -> jax.Array:
-        # Choose the prescribed BC row corresponding to the closest lambda.
-        k = jnp.argmin(jnp.abs(self.lambdas - _lambda))
-        values = self.xb[k]
+        lam = self.lambdas
+        xb = self.xb
 
-        if values.ndim == 2 and values.shape[0] == 1:
-            values = jnp.squeeze(values, axis=0)
+        # clamp to range
+        lam_query = jnp.clip(_lambda, lam[0], lam[-1])
 
-        q_mod = q.at[self.idx_b].set(values)
-        # jax.debug.print("q = {}", q)
-        # jax.debug.print("q_mod = {}", q_mod)
+        # find right interval index i so that lam[i] <= lam_query <= lam[i+1]
+        i = jnp.searchsorted(lam, lam_query, side="right") - 1
+        i = jnp.clip(i, 0, lam.shape[0] - 2)
+
+        lam0 = lam[i]
+        lam1 = lam[i + 1]
+        xb0 = xb[i]
+        xb1 = xb[i + 1]
+
+        t = (lam_query - lam0) / jnp.maximum(lam1 - lam0, 1e-12)
+        values = (1.0 - t) * xb0 + t * xb1
+
         return q.at[self.idx_b].set(values)
 
     def mask(self, q: jax.Array) -> jax.Array:
