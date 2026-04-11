@@ -29,11 +29,19 @@ class Dataset(eqx.Module):
 # =========================================================
 # Base slinky rod (fixed)
 # =========================================================
-def get_slinky():
-    geom = djx.Geometry(0.5, 5e-3)
-    mat = djx.Material(1273.52, 1e7)
+def get_slinky(properties):
 
-    rod, aux = djx.Rod.from_geometry(geom, mat, N=3)
+    geom = djx.Geometry(properties.length, properties.r0)
+    mat = djx.Material(properties.density, properties.E)
+    if properties.start is not None and properties.end is not None:
+        rod, aux = djx.Rod.from_endpoints(
+            start=properties.start,
+            end=properties.end,
+            material=mat,
+            N=properties.N,
+        )
+    else:
+        rod, aux = djx.Rod.from_geometry(geom, mat, N=properties.N)
 
     mass = 0.647
     f = jnp.array([
@@ -89,6 +97,7 @@ def dataset_loss(model, base, aux, data: Dataset):
 # Training
 # =========================================================
 def train_model(
+    properties,
     model_cls,
     params: ModelParams,
     train_file,
@@ -97,7 +106,7 @@ def train_model(
     lr=1e-2,
 ):
     # --- setup ---
-    base, aux = get_slinky()
+    base, aux = get_slinky(properties)
     train = Dataset.load(train_file)
     valid = Dataset.load(valid_file)
 
