@@ -8,6 +8,3 @@ wheels/
 
 # Virtual environments
 .venv
-
-# Working environment for llm-equilibrium
-util
