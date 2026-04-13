@@ -1,6 +1,76 @@
 import json
 import numpy as np
 from datetime import datetime
+import matplotlib.pyplot as plt
+
+
+def _plot_marker_pair(marker_data, coord1="x", coord2="y", title="", xlabel=None, ylabel=None):
+    plt.figure(figsize=(7.5, 6))
+    for name in sorted(marker_data.keys()):
+        a = np.asarray(marker_data[name][coord1], dtype=float)
+        b = np.asarray(marker_data[name][coord2], dtype=float)
+        mask = np.isfinite(a) & np.isfinite(b)
+        if np.any(mask):
+            plt.plot(a[mask], b[mask], linewidth=1.8, label=name)
+
+    plt.xlabel(xlabel if xlabel is not None else coord1)
+    plt.ylabel(ylabel if ylabel is not None else coord2)
+    plt.title(title)
+    plt.legend()
+    plt.axis("equal")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def _plot_ee_pair(a, b, title="", xlabel="x", ylabel="z"):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b)
+
+    plt.figure(figsize=(7.0, 5.5))
+    if np.any(mask):
+        plt.plot(a[mask], b[mask], linewidth=2.0, label="end_effector")
+        plt.scatter(a[mask][0], b[mask][0], s=40, label="start")
+        plt.scatter(a[mask][-1], b[mask][-1], s=40, label="end")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.legend()
+    plt.axis("equal")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def _plot_markers_and_ee_final(marker_data, ee_x, ee_z, title="Final transformed trajectories"):
+    plt.figure(figsize=(8.0, 6.5))
+
+    for name in sorted(marker_data.keys()):
+        x = np.asarray(marker_data[name]["x"], dtype=float)
+        z = np.asarray(marker_data[name]["z"], dtype=float)
+        mask = np.isfinite(x) & np.isfinite(z)
+        if np.any(mask):
+            plt.plot(x[mask], z[mask], linewidth=1.8, label=name)
+            plt.text(x[mask][-1], z[mask][-1], name, fontsize=9)
+
+    ee_x = np.asarray(ee_x, dtype=float)
+    ee_z = np.asarray(ee_z, dtype=float)
+    mask = np.isfinite(ee_x) & np.isfinite(ee_z)
+    if np.any(mask):
+        plt.plot(ee_x[mask], ee_z[mask], linewidth=2.5, label="EE")
+        plt.scatter(ee_x[mask][0], ee_z[mask][0], s=45, marker="o")
+        plt.scatter(ee_x[mask][-1], ee_z[mask][-1], s=45, marker="s")
+        plt.text(ee_x[mask][-1], ee_z[mask][-1], "EE", fontsize=10)
+
+    plt.xlabel("x")
+    plt.ylabel("z")
+    plt.title(title)
+    plt.legend()
+    plt.axis("equal")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
 
 def extract_directbc_dataset(
@@ -8,6 +78,7 @@ def extract_directbc_dataset(
     output_npz_path,
     drop_first_point=True,
     reverse_trajectory=True,
+    make_plots=False,
 ):
     """
     Build direct-BC dataset with format:
@@ -16,15 +87,18 @@ def extract_directbc_dataset(
         idx_b   : (n_b,)
         lambdas : (T,)
 
-    Desired DOF layout:
-        qs = [marker4_x, marker4_y, marker4_z, 0,
-              marker2_x, marker2_y, marker2_z, 0,
-              ee_x, ee_y, ee_z]
+    Plotting behavior when make_plots=True
+    --------------------------------------
+    Initial raw plots:
+      1. Raw markers: x vs y
+      2. Raw EE: y vs z
 
-    Boundary condition:
-        xb = [ee_x, ee_y, ee_z]
+    After transformation and every later processing step:
+      - markers plotted separately in x-z plane
+      - EE plotted separately in x-z plane
 
-    Assumes a single trajectory in the JSON file, so n_traj = 1.
+    Final:
+      - one combined clean x-z plot with all markers + EE
     """
 
     # =========================================================
@@ -47,7 +121,7 @@ def extract_directbc_dataset(
     print(f"Loaded {len(data)} samples")
 
     # =========================================================
-    # Parse timestamps (optional, not used for saving)
+    # Parse timestamps
     # =========================================================
     timestamps = []
     for d in data:
@@ -106,6 +180,28 @@ def extract_directbc_dataset(
             marker_data[name][c] = np.asarray(marker_data[name][c], dtype=float)
 
     # =========================================================
+    # Initial raw plots
+    # markers: x-y
+    # EE: y-z
+    # =========================================================
+    if make_plots:
+        _plot_marker_pair(
+            marker_data,
+            coord1="x",
+            coord2="y",
+            title="Raw marker trajectories (x vs y)",
+            xlabel="x",
+            ylabel="y",
+        )
+        _plot_ee_pair(
+            ee_y_raw,
+            ee_z_raw,
+            title="Raw end-effector trajectory (y vs z)",
+            xlabel="y_raw [mm]",
+            ylabel="z_raw [mm]",
+        )
+
+    # =========================================================
     # Define origin from marker_4 mean position
     # =========================================================
     ref_name = "marker_4"
@@ -130,14 +226,10 @@ def extract_directbc_dataset(
         }
 
     # =========================================================
-    # Coordinate transform
-    #
-    # Based on your pipeline intent:
+    # Coordinate transform for markers
     #   new_x = -old_x
+    #   new_y =  old_z
     #   new_z = -old_y
-    #   new_y = old_z
-    #
-    # This avoids the overwrite bug in the original code.
     # =========================================================
     for name in marker_names:
         old_x = marker_data_centered[name]["x"].copy()
@@ -150,27 +242,44 @@ def extract_directbc_dataset(
 
     # =========================================================
     # EE transform
-    #
-    # Your pipeline used:
     #   ee_x = -ee_y_raw
-    #   ee_z = ee_z_raw
-    #   ee_y = ee_x_raw
-    #
-    # Keep that convention, then convert mm -> m
+    #   ee_y =  ee_x_raw
+    #   ee_z =  ee_z_raw
+    # convert mm -> m
     # =========================================================
     ee_x = -ee_y_raw / 1000.0
     ee_y =  ee_x_raw / 1000.0
     ee_z =  ee_z_raw / 1000.0
 
     # =========================================================
-    # Align EE trajectory so first EE point matches transformed marker_0 first point
+    # Align EE trajectory to transformed marker_0 first point
     # =========================================================
     ee_x = ee_x - ee_x[0] + marker_data_centered["marker_0"]["x"][0]
     ee_y = ee_y - ee_y[0] + marker_data_centered["marker_0"]["y"][0]
     ee_z = ee_z - ee_z[0] + marker_data_centered["marker_0"]["z"][0]
 
     # =========================================================
-    # Remove first point to avoid initial jump
+    # First transformed planar plots: x-z
+    # =========================================================
+    if make_plots:
+        _plot_marker_pair(
+            marker_data_centered,
+            coord1="x",
+            coord2="z",
+            title="Markers after transform and centering (x vs z)",
+            xlabel="x",
+            ylabel="z",
+        )
+        _plot_ee_pair(
+            ee_x,
+            ee_z,
+            title="EE after transform and alignment (x vs z)",
+            xlabel="x [m]",
+            ylabel="z [m]",
+        )
+
+    # =========================================================
+    # Remove first point
     # =========================================================
     if drop_first_point:
         for name in marker_names:
@@ -182,8 +291,25 @@ def extract_directbc_dataset(
         ee_y = ee_y[1:]
         ee_z = ee_z[1:]
 
+        if make_plots:
+            _plot_marker_pair(
+                marker_data_centered,
+                coord1="x",
+                coord2="z",
+                title="Markers after dropping first point (x vs z)",
+                xlabel="x",
+                ylabel="z",
+            )
+            _plot_ee_pair(
+                ee_x,
+                ee_z,
+                title="EE after dropping first point (x vs z)",
+                xlabel="x [m]",
+                ylabel="z [m]",
+            )
+
     # =========================================================
-    # Reverse trajectory direction if desired
+    # Reverse trajectory
     # =========================================================
     if reverse_trajectory:
         for name in marker_names:
@@ -195,6 +321,34 @@ def extract_directbc_dataset(
         ee_y = ee_y[::-1]
         ee_z = ee_z[::-1]
 
+        if make_plots:
+            _plot_marker_pair(
+                marker_data_centered,
+                coord1="x",
+                coord2="z",
+                title="Markers after trajectory reversal (x vs z)",
+                xlabel="x",
+                ylabel="z",
+            )
+            _plot_ee_pair(
+                ee_x,
+                ee_z,
+                title="EE after trajectory reversal (x vs z)",
+                xlabel="x [m]",
+                ylabel="z [m]",
+            )
+
+    # =========================================================
+    # Final clean combined plot: x-z
+    # =========================================================
+    if make_plots:
+        _plot_markers_and_ee_final(
+            marker_data_centered,
+            ee_x=ee_x,
+            ee_z=ee_z,
+            title="Final transformed marker + EE trajectories (x vs z)",
+        )
+
     # =========================================================
     # Sanity check lengths
     # =========================================================
@@ -203,42 +357,29 @@ def extract_directbc_dataset(
         for c in ["x", "y", "z"]:
             if len(marker_data_centered[m][c]) != T:
                 raise ValueError(f"Length mismatch in {m}_{c}")
-    
+
     # =========================================================
     # Build qs
-    # DOF layout:
     # [x0,y0,z0,th0, x1,y1,z1,th1, x2,y2,z2]
-    #
-    # node 0 fixed at origin
-    # node 1 from marker_2, planar => y=0
-    # node 2 from EE, planar => y=0
-    # theta DOFs = 0
     # =========================================================
-    T = len(ee_x)
-
     qs = np.column_stack([
-        np.zeros(T),  # x0
-        np.zeros(T),  # y0
-        np.zeros(T),  # z0
-        np.zeros(T),  # th0
+        np.zeros(T),                             # x0
+        np.zeros(T),                             # y0
+        np.zeros(T),                             # z0
+        np.zeros(T),                             # th0
 
         marker_data_centered["marker_2"]["x"],  # x1
-        np.zeros(T),                            # y1
+        np.zeros(T),                             # y1
         marker_data_centered["marker_2"]["z"],  # z1
-        np.zeros(T),                            # th1
+        np.zeros(T),                             # th1
 
-        ee_x,                                   # x2
-        np.zeros(T),                            # y2
-        ee_z,                                   # z2
-    ])  # shape (T, 11)
-
+        ee_x,                                    # x2
+        np.zeros(T),                             # y2
+        ee_z,                                    # z2
+    ])
 
     # =========================================================
-    # Direct boundary conditions on all fixed/constrained DOFs
-    # idx_b = [0,1,2,3,7,8,9,10]
-    #
-    # xb entries correspond in this exact order:
-    # [x0, y0, z0, th0, th1, x2, y2, z2]
+    # Direct BCs
     # =========================================================
     xb = np.column_stack([
         np.zeros(T),  # x0
@@ -249,23 +390,20 @@ def extract_directbc_dataset(
         ee_x,         # x2
         np.zeros(T),  # y2
         ee_z,         # z2
-    ])  # shape (T, 8)
+    ])
 
     idx_b = np.array([0, 1, 2, 3, 7, 8, 9, 10], dtype=int)
-
 
     # =========================================================
     # Lambdas
     # =========================================================
     lambdas = np.linspace(0.0, 1.0, T)
 
-
     # =========================================================
     # Add trajectory dimension
     # =========================================================
-    qs = qs[None, :, :]   # (1, T, 11)
-    xb = xb[None, :, :]   # (1, T, 8)
-
+    qs = qs[None, :, :]
+    xb = xb[None, :, :]
 
     # =========================================================
     # Save
@@ -284,81 +422,6 @@ def extract_directbc_dataset(
     print("lambdas shape:", lambdas.shape)
 
     return qs, xb, idx_b, lambdas
-
-import numpy as np
-import matplotlib.pyplot as plt
-
-
-def plot_qs_trajectories(qs, traj_idx=0, title=None, show_points=True):
-    """
-    Plot the final planar trajectories encoded in qs.
-
-    Expected DOF layout for one trajectory:
-        [x0, y0, z0, th0, x1, y1, z1, th1, x2, y2, z2]
-
-    We only visualize x-z since the motion is planar and y is zero.
-
-    Parameters
-    ----------
-    qs : array-like
-        Shape (n_traj, T, 11) or (T, 11)
-    traj_idx : int
-        Which trajectory to plot if qs has shape (n_traj, T, 11)
-    title : str or None
-        Plot title
-    show_points : bool
-        Whether to mark sampled time points
-    """
-    qs = np.asarray(qs)
-
-    if qs.ndim == 2:
-        q = qs
-    elif qs.ndim == 3:
-        q = qs[traj_idx]
-    else:
-        raise ValueError("qs must have shape (T,11) or (n_traj,T,11)")
-
-    if q.shape[1] != 11:
-        raise ValueError(f"Expected qs last dimension = 11, got {q.shape[1]}")
-
-    # Extract node coordinates
-    x0, z0 = q[:, 0], q[:, 2]
-    x1, z1 = q[:, 4], q[:, 6]
-    x2, z2 = q[:, 8], q[:, 10]
-
-    fig, ax = plt.subplots(figsize=(7.5, 5.5))
-
-    # Trajectories
-    ax.plot(x0, z0, linewidth=2.0, label="Node 0 (fixed)")
-    ax.plot(x1, z1, linewidth=2.0, label="Node 1 (marker_2)")
-    ax.plot(x2, z2, linewidth=2.5, label="Node 2 (end effector)")
-
-    if show_points:
-        ax.scatter(x0, z0, s=18)
-        ax.scatter(x1, z1, s=18)
-        ax.scatter(x2, z2, s=18)
-
-    # Mark start and end
-    ax.scatter(x0[0], z0[0], s=80, marker="o", label="Start")
-    ax.scatter(x2[-1], z2[-1], s=90, marker="x", label="End")
-
-    # Draw rod shapes at first and last step
-    ax.plot([x0[0], x1[0], x2[0]], [z0[0], z1[0], z2[0]], "--", linewidth=1.5, alpha=0.8)
-    ax.plot([x0[-1], x1[-1], x2[-1]], [z0[-1], z1[-1], z2[-1]], "--", linewidth=1.5, alpha=0.8)
-
-    ax.set_xlabel("x")
-    ax.set_ylabel("z")
-    ax.set_aspect("equal", adjustable="box")
-    ax.grid(True, alpha=0.3)
-
-    if title is None:
-        title = f"Planar trajectories for qs (trajectory {traj_idx})"
-    ax.set_title(title)
-
-    ax.legend()
-    plt.tight_layout()
-    plt.show()
-
 def plot_qs_snapshots(qs, traj_idx=0, title=None, every_step=1):
     """
     Plot the rod configuration at multiple time steps.

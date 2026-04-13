@@ -43,16 +43,17 @@ def get_slinky(properties):
     else:
         rod, aux = djx.Rod.from_geometry(geom, mat, N=properties.N)
 
-    mass = 0.647
-    f = jnp.array([
-        0, 0, mass/4 * -9.81,
-        0, 0, 0,
-        mass/2 * -9.81,
-        0, 0, 0,
-        mass/4 * -9.81,
-    ])
+    if properties.mass is not None:
+        mass = properties.mass
+        f = jnp.array([
+            0, 0, mass/4 * -9.81,
+            0, 0, 0,
+            mass/2 * -9.81,
+            0, 0, 0,
+            mass/4 * -9.81,
+        ])
 
-    rod = eqx.tree_at(lambda r: r.E_ext, rod, djx.Gravity(f))
+        rod = eqx.tree_at(lambda r: r.E_ext, rod, djx.Gravity(f))
     return rod, aux
 
 # =========================================================
@@ -139,12 +140,11 @@ def train_model(
 
     for i in range(n_epochs):
         model, opt_state, train_loss = step(model, opt_state)
+        val_loss = dataset_loss(model, base, aux, valid)
 
         if i % 10 == 0:
-            val_loss = dataset_loss(model, base, aux, valid)
             print(f"Epoch {i:03d} | Train: {train_loss:.3e} | Valid: {val_loss:.3e}")
-        else:
-            val_loss = -1.0
+
         train_hist.append(train_loss)
         valid_hist.append(val_loss)
 

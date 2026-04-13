@@ -15,3 +15,4 @@ class Properties:
     N: int = 20
     start: jax.Array | None = None
     end: jax.Array | None = None
+    mass: float | None = None
