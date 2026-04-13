@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Self
+from typing import Generic, Self, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -7,14 +7,16 @@ import equinox as eqx
 
 from ..states import State
 
+AuxT = TypeVar("AuxT", bound=State | None)
 
-class Stencil(eqx.Module):
+
+class Stencil(eqx.Module, Generic[AuxT]):
     """DDG stencils."""
 
     bar_strain: jax.Array
 
     @classmethod
-    def init(cls, q: jax.Array, aux: State | None = None, **kwargs) -> Self:
+    def init(cls, q: jax.Array, aux: AuxT, **kwargs) -> Self:
         """Get a Stencil instance with an initial configuration.
 
         Args:
@@ -28,9 +30,7 @@ class Stencil(eqx.Module):
         bar_strain = temp_instance.get_strain(q, aux)
         return cls(bar_strain=bar_strain, **kwargs)
 
-    def get_energy(
-        self, q: jax.Array, model: eqx.Module, aux: State | None = None
-    ) -> jax.Array:
+    def get_energy(self, q: jax.Array, model: eqx.Module, aux: AuxT) -> jax.Array:
         """Get scalar energy.
 
         Args:
@@ -42,10 +42,10 @@ class Stencil(eqx.Module):
             jax.Array: Scalar energy.
         """
         del_strain = self.get_strain(q, aux) - self.bar_strain
-        return model(del_strain)
+        return model(del_strain)  # type: ignore
 
     @abstractmethod
-    def get_strain(self, q: jax.Array, aux: State | None = None) -> jax.Array:
+    def get_strain(self, q: jax.Array, aux: AuxT) -> jax.Array:
         """Get strain vector.
 
         Args:
@@ -57,7 +57,7 @@ class Stencil(eqx.Module):
         """
 
     @staticmethod
-    def get_epsilon(n0: jax.Array, n1: jax.Array, l_k: float) -> float:
+    def get_epsilon(n0: jax.Array, n1: jax.Array, l_k: jax.Array) -> jax.Array:
         edge = n1 - n0
         edge_len = jnp.linalg.norm(edge)
         return edge_len / l_k - 1.0
@@ -71,7 +71,7 @@ class Stencil(eqx.Module):
         m2e: jax.Array,
         m1f: jax.Array,
         m2f: jax.Array,
-    ) -> tuple[float, float]:
+    ) -> tuple[jax.Array, jax.Array]:
         ee = n1 - n0
         ef = n2 - n1
         norm_e = jnp.linalg.norm(ee)
@@ -85,5 +85,5 @@ class Stencil(eqx.Module):
         return kappa1, kappa2
 
     @staticmethod
-    def get_tau(theta_e: jax.Array, theta_f: jax.Array, beta: jax.Array) -> float:
+    def get_tau(theta_e: jax.Array, theta_f: jax.Array, beta: jax.Array) -> jax.Array:
         return theta_f - theta_e + beta
