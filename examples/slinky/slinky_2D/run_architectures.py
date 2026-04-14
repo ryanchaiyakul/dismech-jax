@@ -127,6 +127,7 @@ class SweepConfig:
     save_npz: bool = True
     save_plots: bool = True
     verbose: bool = True
+    seed_list: tuple[int, ...] = (0, 1, 2, 3, 4)
 
 
 # =========================================================

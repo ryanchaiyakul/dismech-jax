@@ -6,6 +6,8 @@ import numpy as np
 import dismech_jax as djx
 
 from Energy_NN_architectures import ModelParams
+
+
 # =========================================================
 # Dataset (ONLY direct BC)
 # =========================================================
@@ -30,9 +32,9 @@ class Dataset(eqx.Module):
 # Base slinky rod (fixed)
 # =========================================================
 def get_slinky(properties):
-
     geom = djx.Geometry(properties.length, properties.r0)
     mat = djx.Material(properties.density, properties.E)
+
     if properties.start is not None and properties.end is not None:
         rod, aux = djx.Rod.from_endpoints(
             start=properties.start,
@@ -46,39 +48,83 @@ def get_slinky(properties):
     if properties.mass is not None:
         mass = properties.mass
         f = jnp.array([
-            0, 0, mass/4 * -9.81,
+            0, 0, mass / 4 * -9.81,
             0, 0, 0,
-            mass/2 * -9.81,
+            mass / 2 * -9.81,
             0, 0, 0,
-            mass/4 * -9.81,
+            mass / 4 * -9.81,
         ])
-
         rod = eqx.tree_at(lambda r: r.E_ext, rod, djx.Gravity(f))
+
     return rod, aux
+
 
 # =========================================================
 # Predict
 # =========================================================
-def predict(model, base, aux, idx_b, xb, lambdas):
+def predict(
+    model,
+    base,
+    aux,
+    idx_b,
+    xb,
+    lambdas,
+    max_dlambda=5e-3,
+    iters=5,
+    ls_steps=10,
+):
     bc = djx.BatchedDirectBC(idx_b=idx_b, xb=xb, lambdas=lambdas)
     rod = base.with_bc(bc)
-    pred = rod.solve(model, lambdas, aux, max_dlambda=5e-3, iters=5, ls_steps=10)
+    pred = rod.solve(
+        model,
+        lambdas,
+        aux,
+        max_dlambda=max_dlambda,
+        iters=iters,
+        ls_steps=ls_steps,
+    )
     return pred
+
 
 # =========================================================
 # Loss (MSE over trajectories)
 # =========================================================
-def traj_loss(model, base, aux, idx_b, xb, lambdas, qs_true):
+def traj_loss(
+    model,
+    base,
+    aux,
+    idx_b,
+    xb,
+    lambdas,
+    qs_true,
+    max_dlambda=5e-3,
+    iters=5,
+    ls_steps=10,
+):
     bc = djx.DirectBC(idx_b=idx_b, xb=xb, lambdas=lambdas)
     rod = base.with_bc(bc)
 
-    qs_pred = rod.solve(model, lambdas, aux,
-                        max_dlambda=5e-3, iters=5, ls_steps=10)
+    qs_pred = rod.solve(
+        model,
+        lambdas,
+        aux,
+        max_dlambda=max_dlambda,
+        iters=iters,
+        ls_steps=ls_steps,
+    )
 
     return jnp.mean((qs_pred - qs_true) ** 2)
 
 
-def dataset_loss(model, base, aux, data: Dataset):
+def dataset_loss(
+    model,
+    base,
+    aux,
+    data: Dataset,
+    max_dlambda=5e-3,
+    iters=5,
+    ls_steps=10,
+):
     n_traj = data.qs.shape[0]
 
     # handle shared vs per-trajectory idx_b
@@ -88,7 +134,18 @@ def dataset_loss(model, base, aux, data: Dataset):
         idx_all = data.idx_b
 
     losses = jax.vmap(
-        lambda ib, xb, qs: traj_loss(model, base, aux, ib, xb, data.lambdas, qs)
+        lambda ib, xb, qs: traj_loss(
+            model,
+            base,
+            aux,
+            ib,
+            xb,
+            data.lambdas,
+            qs,
+            max_dlambda=max_dlambda,
+            iters=iters,
+            ls_steps=ls_steps,
+        )
     )(idx_all, data.xb, data.qs)
 
     return jnp.mean(losses)
@@ -105,6 +162,12 @@ def train_model(
     valid_file,
     n_epochs=100,
     lr=1e-2,
+    snapshot_fn=None,
+    snapshot_every=None,
+    valid_every=1,
+    max_dlambda=5e-3,
+    iters=5,
+    ls_steps=10,
 ):
     # --- setup ---
     base, aux = get_slinky(properties)
@@ -126,26 +189,66 @@ def train_model(
     @eqx.filter_jit
     def step(model, opt_state):
         loss, grads = eqx.filter_value_and_grad(
-            lambda m: dataset_loss(m, base, aux, train)
+            lambda m: dataset_loss(
+                m,
+                base,
+                aux,
+                train,
+                max_dlambda=max_dlambda,
+                iters=iters,
+                ls_steps=ls_steps,
+            )
         )(model)
 
-        updates, opt_state = opt.update(grads, opt_state)
+        updates, opt_state = opt.update(grads, opt_state, model)
         model = eqx.apply_updates(model, updates)
 
         return model, opt_state, loss
 
-    # --- training loop ---
     train_hist = []
     valid_hist = []
 
+    last_val_loss = jnp.nan
+
     for i in range(n_epochs):
         model, opt_state, train_loss = step(model, opt_state)
-        val_loss = dataset_loss(model, base, aux, valid)
+        train_hist.append(train_loss)
+
+        do_valid = (valid_every is not None) and (
+            (i % valid_every == 0) or (i == n_epochs - 1)
+        )
+
+        if do_valid:
+            last_val_loss = dataset_loss(
+                model,
+                base,
+                aux,
+                valid,
+                max_dlambda=max_dlambda,
+                iters=iters,
+                ls_steps=ls_steps,
+            )
+
+        valid_hist.append(last_val_loss)
 
         if i % 10 == 0:
-            print(f"Epoch {i:03d} | Train: {train_loss:.3e} | Valid: {val_loss:.3e}")
+            print(
+                f"Epoch {i:03d} | Train: {float(train_loss):.3e} | "
+                f"Valid: {float(last_val_loss):.3e}"
+            )
 
-        train_hist.append(train_loss)
-        valid_hist.append(val_loss)
+        # optional snapshot hook
+        if snapshot_fn is not None and snapshot_every is not None:
+            if (i % snapshot_every == 0) or (i == n_epochs - 1):
+                snapshot_fn(
+                    model=model,
+                    epoch=i,
+                    base=base,
+                    aux=aux,
+                    train=train,
+                    valid=valid,
+                    train_loss=train_loss,
+                    val_loss=last_val_loss,
+                )
 
     return model, train_hist, valid_hist

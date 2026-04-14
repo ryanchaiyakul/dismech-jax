@@ -216,6 +216,42 @@ class Rod(System[TripletState]):
         diag_idx = jnp.arange(H.shape[0])
         return H.at[diag_idx, diag_idx].add(1.0 - mask)
 
+    def get_strains(
+        self,
+        q: jax.Array,
+        aux: TripletState,
+    ) -> jax.Array:
+        """
+        Absolute strains for each triplet at a single configuration.
+
+        Parameters
+        ----------
+        q : (dof,)
+            Global rod DOFs for one configuration.
+        aux : TripletState
+            Aux state for one configuration, with leading dimension n_triplets.
+
+        Returns
+        -------
+        strains : (n_triplets, n_strain)
+            Absolute strain vector for each triplet.
+        """
+        batch_qs = self._global_q_to_batch_q(q)
+        return jax.vmap(
+            lambda t, q_loc, aux_loc: t.get_strain(q_loc, aux_loc)
+        )(self.triplets, batch_qs, aux)
+
+    def get_del_strains(
+        self,
+        q: jax.Array,
+        aux: TripletState,
+    ) -> jax.Array:
+        """
+        Reduced strains for each triplet at a single configuration:
+            del_strain = strain - bar_strain
+        """
+        return self.get_strains(q, aux) - self.triplets.bar_strain
+    
     def get_ode_term(self) -> diffrax.ODETerm:
         if self.is_batched(self.in_axes):
             raise NotImplementedError(
@@ -371,46 +407,30 @@ class Rod(System[TripletState]):
             in_axes=(None, None, 0, None, self.in_axes, None, None, None, None),
         )(model, lambdas, q0, aux, self, iters, ls_steps, c1, max_dlambda)
 
-    def get_del_strain_history(self, qs: jax.Array, auxs: TripletState) -> jax.Array:
+    def get_del_strain_history(
+        self,
+        qs: jax.Array,
+        auxs: TripletState,
+    ) -> jax.Array:
+        """
+        Reduced strain history.
+
+        Parameters
+        ----------
+        qs : (T, dof) or (B, T, dof)
+        auxs : TripletState with matching leading time dims
+            For single trajectory:
+                auxs.t.shape    = (T, n_triplets, 2, 3)
+                auxs.d1.shape   = (T, n_triplets, 2, 3)
+                auxs.beta.shape = (T, n_triplets)
+            For batched trajectories:
+                auxs has leading batch dimension as well.
+
+        Returns
+        -------
+        del_strains : (T, n_triplets, n_strain) or (B, T, n_triplets, n_strain)
+        """
         if qs.ndim == 3:
-            out = []
-            for b in range(qs.shape[0]):
-                aux_b = TripletState(
-                    t=auxs.t[b],
-                    d1=auxs.d1[b],
-                    beta=auxs.beta[b],
-                )
-                out.append(self.get_del_strain_history(qs[b], aux_b))
-            return jnp.stack(out, axis=0)
+            return jax.vmap(self.get_del_strain_history)(qs, auxs)
 
-        del_strains_all = []
-
-        n_steps = qs.shape[0]
-        n_triplets = self.triplets.bar_strain.shape[0]
-
-        for k in range(n_steps):
-            qk = qs[k]
-
-            t_k = auxs.t[k]
-            d1_k = auxs.d1[k]
-            beta_k = auxs.beta[k]
-
-            del_strains_k = []
-            for i in range(n_triplets):
-                triplet_i = Triplet(
-                    bar_strain=self.triplets.bar_strain[i],
-                    l_k=self.triplets.l_k[i],
-                )
-
-                aux_i = TripletState(
-                    t=t_k[i],
-                    d1=d1_k[i],
-                    beta=beta_k[i],
-                )
-
-                del_strain_i = triplet_i.get_strain(qk, aux_i) - triplet_i.bar_strain
-                del_strains_k.append(del_strain_i)
-
-            del_strains_all.append(jnp.stack(del_strains_k, axis=0))
-
-        return jnp.stack(del_strains_all, axis=0)
+        return jax.vmap(self.get_del_strains)(qs, auxs)
