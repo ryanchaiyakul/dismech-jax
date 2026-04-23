@@ -9,7 +9,7 @@ from .bc import AbstractBC
 from .energy import AbstractEnergy, Gravity
 
 from ..models import DER
-from ..stencils import Triplet, Triplet2D
+from ..stencils import Triplet
 from ..states import TripletState
 from ..params import Geometry, Material
 from .system import System
@@ -31,9 +31,8 @@ class Rod(System[TripletState]):
         N: int = 30,
         bc: AbstractBC = AbstractBC(),
         origin: jax.Array = jnp.array([0.0, 0.0, 0.0]),
-        gravity: float = -9.81,
-        is_2d: bool = False,
-    ) -> tuple[Rod, TripletState | None]:
+        gravity: jax.Array = jnp.array([0.0, 0.0, -9.81]),
+    ) -> tuple[Rod, TripletState]:
         if N < 3:
             raise ValueError("Cannot create a rod with less than 3 nodes.")
         if geom.length < 1e-6:
@@ -54,24 +53,22 @@ class Rod(System[TripletState]):
             jnp.arange(N_triplets)
         )
 
-        if is_2d:
-            batch_aux = None
-            triplets = jax.vmap(lambda q, l_k: Triplet2D.init(q, None, l_k=l_k))(
-                batch_q, batch_l_ks
-            )
-        else:
-            t_pair = jnp.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-            d1_pair = jnp.array([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
-            ts = jnp.broadcast_to(t_pair, (N_triplets, 2, 3))
-            d1s = jnp.broadcast_to(d1_pair, (N_triplets, 2, 3))
-            betas = jnp.zeros(N_triplets)
+        t_pair = jnp.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        d1_pair = jnp.array([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+        ts = jnp.broadcast_to(t_pair, (N_triplets, 2, 3))
+        d1s = jnp.broadcast_to(d1_pair, (N_triplets, 2, 3))
+        betas = jnp.zeros(N_triplets)
 
-            batch_aux = jax.vmap(TripletState)(ts, d1s, betas)
-            triplets = jax.vmap(lambda q, a, l_k: Triplet.init(q, a, l_k=l_k))(
-                batch_q, batch_aux, batch_l_ks
-            )
+        batch_aux = jax.vmap(TripletState)(ts, d1s, betas)
+        triplets = jax.vmap(lambda q, a, l_k: Triplet.init(q, a, l_k=l_k))(
+            batch_q, batch_aux, batch_l_ks
+        )
 
-        F_ext = jnp.zeros_like(q0).at[2::4].set(mass[2::4] * gravity)
+        mass_padded = jnp.pad(mass, (0, 1))
+        mass_reshaped = mass_padded.reshape(-1, 4)
+        F_reshaped = jnp.zeros_like(mass_reshaped)
+        F_reshaped = F_reshaped.at[:, :3].set(mass_reshaped[:, :3] * gravity)
+        F_ext = F_reshaped.ravel()[:-1]
 
         rod = Rod(
             triplets=triplets,
