@@ -46,11 +46,11 @@ def solve_step(
         slope = jnp.dot(res, delta_q)
 
         # Parallel line search
-        test_qs = q - alphas[:, None] * delta_q
+        test_qs = q + alphas[:, None] * delta_q
         test_energies = jax.vmap(lambda _q: sys.get_E(_lambda, _q, model, aux))(test_qs)
 
         # If Armijo fails, take the smallest possible step
-        is_good = test_energies <= e_old + c1 * alphas * slope  # Armijo Condition
+        is_good = test_energies <= e_old - c1 * alphas * slope  # Armijo Condition
         safe_idx = jnp.where(jnp.any(is_good), jnp.argmax(is_good), ls_steps - 1)
 
         next_q = test_qs[safe_idx]
