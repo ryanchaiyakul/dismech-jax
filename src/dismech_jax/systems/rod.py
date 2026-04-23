@@ -169,7 +169,23 @@ class Rod(System[TripletState]):
             jax.Array: square Hessian.
         """
         mask = self.bc.mask(q)
-        H = jax.hessian(self.get_E, 1)(_lambda, q, model, aux)
+        batch_qs = self._global_q_to_batch_q(q)
+        H_batched = jax.vmap(
+            lambda t, q_loc, _aux: jax.hessian(t.get_energy)(q_loc, model, _aux)
+        )(self.triplets, batch_qs, aux)
+
+        # Get global indices
+        base_idx = jnp.arange(H_batched.shape[0]) * 4  # TODO: parameterize overlap
+        offset = jnp.arange(H_batched.shape[1])
+        global_idx = base_idx[:, None] + offset[None, :]
+
+        # Row/Column
+        rows = global_idx[:, :, None]
+        cols = global_idx[:, None, :]
+
+        # Assemble H
+        H = jnp.zeros((q.shape[0], q.shape[0]))
+        H = H.at[rows, cols].add(H_batched)
         H = H * mask[:, None] * mask[None, :]
         diag_idx = jnp.arange(H.shape[0])
         return H.at[diag_idx, diag_idx].add(1.0 - mask)
