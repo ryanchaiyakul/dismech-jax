@@ -1,1 +1,1 @@
-from .der import DER
+from .der import DER, DER2D

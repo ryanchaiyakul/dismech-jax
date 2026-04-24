@@ -5,6 +5,7 @@ from .models import DER
 from .systems import (
     System,
     Rod,
+    Rod2D,
     AbstractBC,
     LinearBC,
     BatchedLinearBC,

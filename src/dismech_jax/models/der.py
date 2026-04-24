@@ -33,3 +33,22 @@ class DER(eqx.Module):
 
     def __call__(self, del_strain: jax.Array) -> jax.Array:
         return jnp.sum(self.K * del_strain**2)
+
+
+class DER2D(eqx.Module):
+    K: jax.Array  # [EA1, EA2, EI]
+
+    @classmethod
+    def from_legacy(cls, l_k: jax.Array, geom: Geometry, material: Material):
+        A = geom.axs if geom.axs else jnp.pi * geom.r0**2
+        EA = material.youngs_rod * A
+        EI = material.youngs_rod * (geom.ixs1 if geom.ixs1 else jnp.pi * geom.r0**4 / 4)
+
+        # Rescale
+        EA *= l_k
+        EI /= l_k
+
+        return cls(jnp.array([EA, EA, EI]))
+
+    def __call__(self, del_strain: jax.Array) -> jax.Array:
+        return jnp.sum(self.K * del_strain**2)

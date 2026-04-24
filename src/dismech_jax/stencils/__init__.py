@@ -1,2 +1,2 @@
-from .triplet import Triplet
+from .triplet import Triplet, Triplet2D
 from .stencil import Stencil
