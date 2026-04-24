@@ -47,8 +47,8 @@ class Triplet2D(Stencil[None]):
         n2 = q[4:6]
         eps0 = self.get_epsilon(n0, n1, l_ke)
         eps1 = self.get_epsilon(n1, n2, l_kf)
-        kappa1, kappa2 = self.get_kappa_2d(n0, n1, n2)
-        return jnp.array([eps0, eps1, kappa1])
+        kappa = self.get_kappa_2d(n0, n1, n2)
+        return jnp.array([eps0, eps1, kappa])
 
     @staticmethod
     def get_kappa_2d(n0: jax.Array, n1: jax.Array, n2: jax.Array) -> jax.Array:

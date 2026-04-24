@@ -16,7 +16,7 @@ from .system import System
 from ..solver import solve
 
 
-class Rod2D(System[TripletState]):
+class Rod2D(System[None]):
     triplets: Triplet2D
     mass: jax.Array
     q0: jax.Array
@@ -106,7 +106,7 @@ class Rod2D(System[TripletState]):
         return self.bc.apply(q0, _lambda)
 
     def get_E(
-        self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
+        self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: None = None
     ) -> jax.Array:
         """Get scalar energy of state `q` at `_lambda` after applied boundary condition.
 
@@ -121,8 +121,8 @@ class Rod2D(System[TripletState]):
         """
         batch_qs = self._global_q_to_batch_q(q)
         E_int = jnp.sum(
-            jax.vmap(lambda t, q_loc, _aux: t.get_energy(q_loc, model, _aux))(
-                self.triplets, batch_qs, aux
+            jax.vmap(lambda t, q_loc: t.get_energy(q_loc, model, None))(
+                self.triplets, batch_qs
             )
         )
         return E_int + self.E_ext(q, _lambda)
@@ -255,7 +255,7 @@ class Rod2D(System[TripletState]):
     @staticmethod
     def _get_mass(geom: Geometry, material: Material, l_ks: jax.Array) -> jax.Array:
         N = l_ks.shape[0] + 1  # Number of nodes
-        mass = jnp.zeros(N * 4 - 1)
+        mass = jnp.zeros(N * 2)
         A = geom.axs if geom.axs else jnp.pi * geom.r0**2
 
         # Node contributions
