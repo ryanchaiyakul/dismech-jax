@@ -114,7 +114,7 @@ class Rod2D(System[None]):
             _lambda (jax.Array): Lambda.
             q (jax.Array): Initial state.
             model (eqx.Module): Energy model.
-            aux (TripletState): Triplet director object.
+            aux (None): None.
 
         Returns:
             jax.Array: Scalar energy.
@@ -128,7 +128,7 @@ class Rod2D(System[None]):
         return E_int + self.E_ext(q, _lambda)
 
     def get_F(
-        self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
+        self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: None = None
     ) -> jax.Array:
         """Get vector force of state `q` at `_lambda` after applied boundary condition.
 
@@ -136,7 +136,7 @@ class Rod2D(System[None]):
             _lambda (jax.Array): Lambda.
             q (jax.Array): Initial state.
             model (eqx.Module): Energy model.
-            aux (TripletState): Triplet director object.
+            aux (None): None.
 
         Returns:
             jax.Array: Vector force.
@@ -145,7 +145,7 @@ class Rod2D(System[None]):
         return mask * jax.grad(self.get_E, 1)(_lambda, q, model, aux)
 
     def get_H(
-        self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: TripletState
+        self, _lambda: jax.Array, q: jax.Array, model: eqx.Module, aux: None = None
     ) -> jax.Array:
         """Get square Hessian of state `q` at `_lambda` after applied boundary condition.
 
@@ -153,7 +153,7 @@ class Rod2D(System[None]):
             _lambda (jax.Array): Lambda.
             q (jax.Array): Initial state.
             model (eqx.Module): Energy model.
-            aux (TripletState): Triplet director object.
+            aux (None): None.
 
         Returns:
             jax.Array: square Hessian.
