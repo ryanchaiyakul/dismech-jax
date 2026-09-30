@@ -8,8 +8,6 @@ from ..legacy import Geometry, Material
 
 
 class DER(eqx.Module):
-    """Quadratic rod energy density. Discretization lengths live in the stencil."""
-
     K: jax.Array  # [EA1, EA2, EI1, EI2, GJ]
 
     @classmethod
@@ -23,11 +21,10 @@ class DER(eqx.Module):
         else:
             EI1 = EI2 = material.youngs_rod * jnp.pi * geom.r0**4 / 4
 
-        # Polar moment of area
         J = geom.jxs if geom.jxs else jnp.pi * geom.r0**4 / 2
         GJ = material.youngs_rod / (2 * (1 + material.poisson_rod)) * J
 
         return cls(jnp.array([EA, EA, EI1, EI2, GJ]))
 
     def __call__(self, del_strain: jax.Array) -> jax.Array:
-        return jnp.sum(self.K * del_strain**2)
+        return 0.5 * jnp.sum(self.K * del_strain**2)

@@ -11,10 +11,10 @@ class Triplet(Stencil[TripletState]):
 
     Strains are densities `[eps_e, eps_f, kappa1/l, kappa2/l, tau/l]` with the
     Voronoi length `l = mean(l_k)` as the measure, so the energy
-    `l * model(del_strain)` recovers `EA eps^2 l` and `EI kappa^2 / l`.
+    `l * model(del_strain)` recovers `EA eps^2 l / 2` and `EI kappa^2 / (2 l)`.
     """
 
-    l_k: jax.Array  # [l_ke, l_kf] rest edge lengths
+    l_k: jax.Array  # [l_ke, l_kf]
 
     def get_measure(self) -> jax.Array:
         return jnp.mean(self.l_k)

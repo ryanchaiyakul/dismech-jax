@@ -17,123 +17,131 @@ def _stop_gradient(tree):
 
 def _newton(
     sys: System,
-    t: jax.Array,
-    q0: jax.Array,
+    z: jax.Array,
+    x0: jax.Array,
     aux: Aux,
     iters: int,
     ls_steps: int,
     c1: float,
-) -> jax.Array:
+    tol: float,
+) -> tuple[jax.Array, jax.Array]:
     alphas = 0.5 ** jnp.arange(ls_steps)
 
-    def newton_step(carry, _):
-        q, m_old, res = carry
+    def not_converged(carry):
+        _, _, res, k = carry
+        return (k < iters) & (jnp.linalg.norm(res) > tol)
 
-        # TODO: use SOCU for blockdiagonal
-        H = sys.jacobian(q, t, aux)
+    def newton_step(carry):
+        x, e_old, res, k = carry
+
+        H, _ = sys.hessian(x, z, aux)
         H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
-        delta_q = jnp.linalg.solve(H_reg, res)
-        # Descent rate of the merit along the Newton direction
-        slope = jnp.dot(res, delta_q) if sys.is_conservative else jnp.dot(res, res)
+        delta_x = jnp.linalg.solve(H_reg, res)
+
+        # `res` is -grad(E), so `slope > 0` iff `delta_x` is a descent direction.
+        # If H is indefinite it may not be: use steepest descent.
+        slope = jnp.dot(res, delta_x)
+        is_descent = slope > 0.0
+        delta_x = jnp.where(is_descent, delta_x, res)
+        slope = jnp.where(is_descent, slope, jnp.dot(res, res))
 
         # Parallel line search
-        test_qs = q + alphas[:, None] * delta_q
-        test_merits = jax.vmap(lambda _q: sys.merit(_q, t, aux))(test_qs)
+        test_xs = x + alphas[:, None] * delta_x
+        test_es = jax.vmap(lambda _x: sys.energy(_x, z, aux))(test_xs)
 
         # If Armijo fails, take the smallest possible step
-        is_good = test_merits <= m_old - c1 * alphas * slope  # Armijo Condition
+        is_good = test_es <= e_old - c1 * alphas * slope  # Armijo Condition
         safe_idx = jnp.where(jnp.any(is_good), jnp.argmax(is_good), ls_steps - 1)
 
-        next_q = test_qs[safe_idx]
-        next_m = test_merits[safe_idx]
-        next_res = -sys.residual(next_q, t, aux)
+        next_x = test_xs[safe_idx]
+        next_e = test_es[safe_idx]
+        next_res = -sys.residual(next_x, z, aux)
 
-        return (next_q, next_m, next_res), jnp.linalg.norm(next_res)
+        return next_x, next_e, next_res, k + 1
 
-    q_init = sys.bc.apply(q0, t)
-    init_m = sys.merit(q_init, t, aux)
-    init_res = -sys.residual(q_init, t, aux)
-    (final_q, _, _), _ = jax.lax.scan(
-        newton_step, (q_init, init_m, init_res), None, iters
+    init_e = sys.energy(x0, z, aux)
+    init_res = -sys.residual(x0, z, aux)
+    final_x, _, final_res, _ = jax.lax.while_loop(
+        not_converged, newton_step, (x0, init_e, init_res, 0)
     )
-    return final_q
+    return final_x, jnp.linalg.norm(final_res)
 
 
-@eqx.filter_jit
-def solve_step(
+def _solve_one(
     sys: System,
-    t: jax.Array,
-    q0: jax.Array,
+    z: jax.Array,
+    x0: jax.Array,
     aux: Aux,
-    iters: int = 10,
-    ls_steps: int = 10,
-    c1: float = 1e-4,
-) -> jax.Array:
-    """Solve `sys.residual(q, t, aux) = 0` starting from `q0`.
-
-    Differentiable (forward and reverse mode) w.r.t. every array in `sys`,
-    `aux` and `t` via the implicit function theorem. `q0` is only an initial
-    guess and receives no gradient.
-    """
+    iters: int,
+    ls_steps: int,
+    c1: float,
+    tol: float,
+) -> tuple[jax.Array, jax.Array]:
     # Newton iterations are never differentiated through
-    q_star = _newton(*_stop_gradient((sys, t, q0, aux)), iters, ls_steps, c1)
-    H = jax.lax.stop_gradient(sys.jacobian(q_star, t, aux))
-    H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
+    x_star, res_norm = _newton(
+        *_stop_gradient((sys, z, x0, aux)), iters, ls_steps, c1, tol
+    )
+    H, _ = sys.hessian(x_star, z, aux)
+    H_reg = jax.lax.stop_gradient(H).at[jnp.diag_indices(H.shape[0])].add(1e-8)
 
-    return jax.lax.custom_root(
-        lambda q: sys.residual(q, t, aux),
-        q_star,
-        lambda _f, q: q,  # already solved
+    # Implicit function theorem: dx/dp = -H_xx^-1 d(residual)/dp, where `p` is
+    # anything in `sys`, `z` or `aux`.
+    x = jax.lax.custom_root(
+        lambda x: sys.residual(x, z, aux),
+        x_star,
+        lambda _f, x: x,  # already solved
         lambda _g, y: jnp.linalg.solve(H_reg, y),
     )
+    return x, res_norm
 
 
 @eqx.filter_jit
 def solve(
     sys: System,
-    ts: jax.Array,
+    zs: jax.Array,
     aux: Aux,
-    q0: jax.Array | None = None,
+    x0: jax.Array | None = None,
     iters: int = 10,
     ls_steps: int = 10,
     c1: float = 1e-4,
-    substeps: int = 1,
-) -> jax.Array:
-    """Solve for the quasi-static equilibrium at every `t` in `ts`.
+    tol: float = 1e-10,
+) -> tuple[jax.Array, jax.Array]:
+    """Solve `sys.residual(x, z, aux) = 0` for each fixed state `z` in `zs`.
 
-    Gradients are exact w.r.t. every array in `sys` (e.g. rest strain, BC
-    values, material models), `aux` and `ts`, including the path dependence
-    through the aux updates between steps.
+    The solves run in order. Each starts from the previous solution and the aux
+    is updated in between (path dependence). Use a single row for one
+    equilibrium and several rows to load step.
+
+    Gradients (forward and reverse) are exact w.r.t. every array in `sys`,
+    `zs` and `aux`, including the path dependence, via the implicit function
+    theorem. `x0` is only an initial guess and receives no gradient.
 
     Args:
         sys (System): system.
-        ts (jax.Array): times `(N,)`.
+        zs (jax.Array): fixed DOFs `(N, # of fixed DOFs)`.
         aux (Aux): initial aux state, aligned with `sys.terms`.
-        q0 (jax.Array | None, optional): initial guess. Defaults to `sys.q0`.
-        iters (int, optional): Number of newton-raphson iterations. Defaults to 10.
+        x0 (jax.Array | None, optional): initial guess for the free DOFs.
+            Defaults to `sys.x0`.
+        iters (int, optional): Maximum number of newton-raphson iterations.
+            Defaults to 10.
         ls_steps (int, optional): Number of alphas evaluated. Defaults to 10.
         c1 (float, optional): Armijo coefficient. Defaults to 1e-4.
-        substeps (int, optional): Equal substeps between consecutive
-            `ts`. Defaults to 1.
+        tol (float, optional): Newton stops early once the residual norm
+            `|dE/dx|` is at most `tol` (absolute, in force units). Use `0.0` to
+            always run `iters` iterations. Defaults to 1e-10.
 
     Returns:
-        jax.Array: Solved state `(N, # of DOFs)`.
+        tuple[jax.Array, jax.Array]: Free DOFs `xs` `(N, # of free DOFs)` and the
+            residual norm `(N,)` at each solve (not differentiable). Check it
+            against a tolerance, since Newton does not raise if `iters` runs
+            out first. Use `sys.join(xs, zs)` for the full states.
     """
-    q0 = sys.q0 if q0 is None else q0
+    x0 = sys.x0 if x0 is None else x0
 
-    def step(carry, t):
-        q, aux = carry
-        q = solve_step(sys, t, q, aux, iters, ls_steps, c1)
-        return (q, sys.update(aux, q)), None
+    def step(carry, z):
+        x, aux = carry
+        x, res_norm = _solve_one(sys, z, x, aux, iters, ls_steps, c1, tol)
+        return (x, sys.update(aux, x, z)), (x, res_norm)
 
-    def outer(carry, sub_ts):
-        carry, _ = jax.lax.scan(step, carry, sub_ts)
-        return carry, carry[0]
-
-    carry, _ = step((q0, aux), ts[0])
-
-    # Equal substeps between consecutive `ts`, ending exactly on each `t`
-    fracs = jnp.arange(1, substeps + 1, dtype=ts.dtype) / substeps
-    sub_ts = ts[:-1, None] + (ts[1:] - ts[:-1])[:, None] * fracs
-    _, qs = jax.lax.scan(outer, carry, sub_ts)
-    return jnp.concatenate([carry[0][None], qs])
+    _, (xs, res_norms) = jax.lax.scan(step, (x0, aux), zs)
+    return xs, res_norms

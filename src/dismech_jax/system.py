@@ -1,110 +1,110 @@
 from __future__ import annotations
 
-from typing import Any, Self
+from collections.abc import Sequence
+from typing import Any
 
-import diffrax
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 
-from .bc import AbstractBC
-from .forces import Energy, Force, StencilEnergy
+from .energies import Energy
+from .solver import solve
 
 type Aux = tuple[Any, ...]
 
 
 class System(eqx.Module):
-    """Equilibrium of the sum of `terms` under the boundary condition `bc`.
-
-    `aux` is a tuple aligned with `terms` (`None` for terms without aux).
-    Gradients of the solution are defined w.r.t. every array in the system
-    (BC values, rest strains, material models, ...), `aux` and `t`.
-    """
-
+    terms: tuple[Energy, ...]
+    idx_x: jax.Array
+    idx_z: jax.Array
     q0: jax.Array
-    bc: AbstractBC
-    terms: tuple[Force, ...]
-    mass: jax.Array | None = None
 
-    def with_bc(self, bc: AbstractBC) -> Self:
-        """Get a copy of the system with `self.bc` replaced with `bc`."""
-        return eqx.tree_at(lambda s: s.bc, self, bc)
-
-    def with_rest(self, q_rest: jax.Array, aux: Aux) -> Self:
-        """Get a copy with every stencil term's rest strain measured at `q_rest`."""
-        terms = tuple(
-            f.with_rest(q_rest, a) if isinstance(f, StencilEnergy) else f
-            for f, a in zip(self.terms, aux, strict=True)
-        )
-        return eqx.tree_at(lambda s: s.terms, self, terms)
+    @classmethod
+    def create(
+        cls, terms: Sequence[Energy], q0: jax.Array, fixed: jax.Array | Sequence[int]
+    ) -> System:
+        """Build a system from `terms`, the initial state `q0` and the indices of
+        the fixed DOFs `fixed`."""
+        n = q0.shape[0]
+        fixed = np.unique(np.asarray(fixed, dtype=int))
+        if fixed.size and (fixed[0] < 0 or fixed[-1] >= n):
+            raise ValueError("`fixed` contains an index outside of the state.")
+        free = np.setdiff1d(np.arange(n), fixed)
+        return cls(tuple(terms), jnp.asarray(free), jnp.asarray(fixed), q0)
 
     @property
-    def is_conservative(self) -> bool:
-        """True if every term is an `Energy`, so `merit` is the total energy."""
-        return all(isinstance(f, Energy) for f in self.terms)
+    def n_dofs(self) -> int:
+        return self.q0.shape[0]
 
-    def residual(self, q: jax.Array, t: jax.Array, aux: Aux) -> jax.Array:
-        """Get the equilibrium residual of state `q` at `t`.
+    @property
+    def x0(self) -> jax.Array:
+        """Free DOFs of `q0`."""
+        return self.q0[self.idx_x]
 
-        Free rows are the masked net force `-sum(F)` and constrained rows are
-        `q - bc(q)`, so the residual depends on the BC values (making them
-        differentiable) and its Jacobian is non-singular.
-        """
-        q_bc = self.bc.apply(q, t)
-        mask = self.bc.mask(q)
-        F = sum(
-            (f.F(q_bc, t, a) for f, a in zip(self.terms, aux, strict=True)),
+    @property
+    def z0(self) -> jax.Array:
+        """Fixed DOFs of `q0`."""
+        return self.q0[self.idx_z]
+
+    def join(self, x: jax.Array, z: jax.Array) -> jax.Array:
+        """Assemble the full state `q` from `x` and `z` (leading batch dims ok)."""
+        dtype = jnp.result_type(x, z)
+        q = jnp.zeros(x.shape[:-1] + (self.n_dofs,), dtype=dtype)
+        return q.at[..., self.idx_x].set(x).at[..., self.idx_z].set(z)
+
+    def split(self, q: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Split the full state `q` into `(x, z)`."""
+        return q[..., self.idx_x], q[..., self.idx_z]
+
+    def energy(self, x: jax.Array, z: jax.Array, aux: Aux) -> jax.Array:
+        """Total potential energy."""
+        q = self.join(x, z)
+        return sum(
+            (f.E(q, a) for f, a in zip(self.terms, aux, strict=True)),
+            jnp.zeros(()),
+        )
+
+    def _grad(self, x: jax.Array, z: jax.Array, aux: Aux) -> jax.Array:
+        q = self.join(x, z)
+        return sum(
+            (f.F(q, a) for f, a in zip(self.terms, aux, strict=True)),
             jnp.zeros_like(q),
         )
-        return -mask * F + q - q_bc
 
-    def jacobian(self, q: jax.Array, t: jax.Array, aux: Aux) -> jax.Array:
-        """Get the Jacobian of `residual` w.r.t. `q` (masked stiffness, identity on BCs)."""
-        q_bc = self.bc.apply(q, t)
-        mask = self.bc.mask(q)
+    def residual(self, x: jax.Array, z: jax.Array, aux: Aux) -> jax.Array:
+        """Gradient of the energy w.r.t. the free DOFs, `dE/dx`. Zero at equilibrium."""
+        return self._grad(x, z, aux)[self.idx_x]
+
+    def support_force(self, x: jax.Array, z: jax.Array, aux: Aux) -> jax.Array:
+        """Force the supports exert on the fixed DOFs, `dE/dz`."""
+        return self._grad(x, z, aux)[self.idx_z]
+
+    def hessian(
+        self, x: jax.Array, z: jax.Array, aux: Aux
+    ) -> tuple[jax.Array, jax.Array]:
+        """Blocks `(H_xx, H_xz)` of the energy Hessian."""
+        q = self.join(x, z)
         H = sum(
-            (f.H(q_bc, t, a) for f, a in zip(self.terms, aux, strict=True)),
-            jnp.zeros((q.shape[0], q.shape[0]), dtype=q.dtype),
+            (f.H(q, a) for f, a in zip(self.terms, aux, strict=True)),
+            jnp.zeros((self.n_dofs, self.n_dofs), dtype=q.dtype),
         )
-        H = H * mask[:, None] * mask[None, :]
-        diag_idx = jnp.arange(H.shape[0])
-        return H.at[diag_idx, diag_idx].add(1.0 - mask)
+        return H[jnp.ix_(self.idx_x, self.idx_x)], H[jnp.ix_(self.idx_x, self.idx_z)]
 
-    def merit(self, q: jax.Array, t: jax.Array, aux: Aux) -> jax.Array:
-        """Line search objective: total energy if conservative, else `|R|^2 / 2`."""
-        if self.is_conservative:
-            return sum(
-                (f.E(q, t, a) for f, a in zip(self.terms, aux, strict=True)),  # type: ignore
-                jnp.zeros(()),
-            )
-        return 0.5 * jnp.sum(self.residual(q, t, aux) ** 2)
-
-    def update(self, aux: Aux, q: jax.Array) -> Aux:
-        """Update each term's aux at the converged state `q`."""
+    def update(self, aux: Aux, x: jax.Array, z: jax.Array) -> Aux:
+        """Update each term's aux at the state `(x, z)`."""
+        q = self.join(x, z)
         return tuple(f.update(a, q) for f, a in zip(self.terms, aux, strict=True))
 
-    def get_ode_term(self) -> diffrax.ODETerm:
-        """Get `diffrax.ODETerm` to solve a ODE with `args=aux`."""
-
-        if self.mass is None:
-            raise ValueError("get_ode_term: system has no mass.")
-
-        @eqx.filter_jit
-        def rhs(t, y, aux):
-            t = jnp.asarray(t)
-
-            # split [q, v]
-            n_dofs = self.q0.shape[0]
-            q, v = y[:n_dofs], y[n_dofs:]
-
-            # Get fixed DOF
-            q_fixed, v_fixed = jax.jvp(
-                lambda t: self.bc.apply(q, t), (t,), (jnp.ones_like(t),)
-            )
-
-            # update [q, v]
-            v = v * self.bc.mask(q) + v_fixed * (1.0 - self.bc.mask(q))
-            a = -self.residual(q_fixed, t, aux) / self.mass
-            return jnp.concatenate([v, a])
-
-        return diffrax.ODETerm(rhs)
+    def solve(
+        self,
+        zs: jax.Array,
+        aux: Aux,
+        x0: jax.Array | None = None,
+        iters: int = 10,
+        ls_steps: int = 10,
+        c1: float = 1e-4,
+        tol: float = 1e-10,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Solve for equilibrium at each fixed state in `zs`. See `solver.solve`."""
+        return solve(self, zs, aux, x0, iters, ls_steps, c1, tol)

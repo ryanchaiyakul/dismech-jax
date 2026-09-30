@@ -4,8 +4,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from ..bc import AbstractBC
-from ..forces import Gravity, StencilEnergy
+from ..energies import ConstantForceEnergy, Energy, StencilEnergy
 from ..models import DER
 from ..states import TripletState
 from ..stencils import Triplet
@@ -17,33 +16,46 @@ def make_rod(
     geom: Geometry,
     material: Material,
     N: int = 30,
-    bc: AbstractBC = AbstractBC(),
-    origin: jax.Array = jnp.array([0.0, 0.0, 0.0]),
-    gravity: jax.Array = jnp.array([0.0, 0.0, -9.81]),
+    fixed: jax.Array | None = None,
+    origin: jax.Array | None = None,
+    gravity: jax.Array | None = None,
     model: eqx.Module | None = None,
-) -> tuple[System, tuple[TripletState, None]]:
+    extra_terms: tuple[Energy, ...] = (),
+) -> tuple[System, tuple]:
     """Build a discrete elastic rod with DOFs `[x0, y0, z0, theta0, x1, ..., zN]`.
 
-    The terms are `(StencilEnergy[Triplet], Gravity)`, so aux is
-    `(TripletState, None)`.
+    The terms are `(StencilEnergy[Triplet], ConstantForceEnergy, *extra_terms)`, so aux
+    is `(TripletState, None, *[None] * len(extra_terms))` for aux-free extras.
 
     Args:
         geom (Geometry): Geometry object.
         material (Material): Material object.
         N (int, optional): Number of nodes. Defaults to 30.
-        bc (AbstractBC, optional): Boundary condition.
-        origin (jax.Array, optional): Position of the first node.
-        gravity (jax.Array, optional): Gravitational acceleration.
+        fixed (jax.Array | None, optional): Indices of the fixed DOFs. Their
+            values in `solve` are the `zs` passed there; `sys.z0` is the
+            undeformed value. Defaults to none (all DOFs free).
+        origin (jax.Array | None, optional): Position of the first node.
+            Defaults to `[0, 0, 0]`.
+        gravity (jax.Array | None, optional): Gravitational acceleration.
+            Defaults to `[0, 0, -9.81]`.
         model (eqx.Module | None, optional): Constitutive law. Defaults to
             `DER.from_legacy(geom, material)`.
+        extra_terms (tuple[Energy, ...], optional): Additional aux-free energy
+            terms. Defaults to none.
 
     Returns:
-        tuple[System, tuple[TripletState, None]]: System and initial aux.
+        tuple[System, tuple]: System and initial aux.
     """
     if N < 3:
         raise ValueError("Cannot create a rod with less than 3 nodes.")
     if geom.length < 1e-6:
         raise ValueError("Cannot create a rod less than 1 um.")
+    if fixed is None:
+        fixed = jnp.array([], dtype=int)
+    if origin is None:
+        origin = jnp.array([0.0, 0.0, 0.0])
+    if gravity is None:
+        gravity = jnp.array([0.0, 0.0, -9.81])
     if model is None:
         model = DER.from_legacy(geom, material)
 
@@ -77,13 +89,12 @@ def make_rod(
     F_reshaped = F_reshaped.at[:, :3].set(mass_reshaped[:, :3] * gravity)
     F_ext = F_reshaped.ravel()[:-1]
 
-    rod = System(
+    rod = System.create(
+        terms=(StencilEnergy(triplets, conn, model), ConstantForceEnergy(F_ext), *extra_terms),
         q0=q0,
-        bc=bc,
-        terms=(StencilEnergy(triplets, conn, model), Gravity(F_ext)),
-        mass=mass,
+        fixed=fixed,
     )
-    return rod, (batch_aux, None)
+    return rod, (batch_aux, None, *[None] * len(extra_terms))
 
 
 def _get_mass(geom: Geometry, material: Material, l_ks: jax.Array) -> jax.Array:
