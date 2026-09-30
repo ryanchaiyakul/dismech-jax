@@ -1,8 +1,8 @@
 from abc import abstractmethod
 from typing import Self
 
-import jax
 import equinox as eqx
+import jax
 
 
 class State(eqx.Module):

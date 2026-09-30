@@ -1,15 +1,19 @@
+from typing import Self
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 
-from ..params import Geometry, Material
+from ..legacy import Geometry, Material
 
 
 class DER(eqx.Module):
+    """Quadratic rod energy density. Discretization lengths live in the stencil."""
+
     K: jax.Array  # [EA1, EA2, EI1, EI2, GJ]
 
     @classmethod
-    def from_legacy(cls, l_k: jax.Array, geom: Geometry, material: Material):
+    def from_legacy(cls, geom: Geometry, material: Material) -> Self:
         A = geom.axs if geom.axs else jnp.pi * geom.r0**2
         EA = material.youngs_rod * A
 
@@ -19,36 +23,11 @@ class DER(eqx.Module):
         else:
             EI1 = EI2 = material.youngs_rod * jnp.pi * geom.r0**4 / 4
 
-        # TODO: what is proper name
-        something = geom.jxs if geom.jxs else jnp.pi * geom.r0**4 / 2
-        GJ = material.youngs_rod / (2 * (1 + material.poisson_rod)) * something
-
-        # Rescale
-        EA *= l_k
-        EI1 /= l_k
-        EI2 /= l_k
-        GJ /= l_k
+        # Polar moment of area
+        J = geom.jxs if geom.jxs else jnp.pi * geom.r0**4 / 2
+        GJ = material.youngs_rod / (2 * (1 + material.poisson_rod)) * J
 
         return cls(jnp.array([EA, EA, EI1, EI2, GJ]))
-
-    def __call__(self, del_strain: jax.Array) -> jax.Array:
-        return jnp.sum(self.K * del_strain**2)
-
-
-class DER2D(eqx.Module):
-    K: jax.Array  # [EA1, EA2, EI]
-
-    @classmethod
-    def from_legacy(cls, l_k: jax.Array, geom: Geometry, material: Material):
-        A = geom.axs if geom.axs else jnp.pi * geom.r0**2
-        EA = material.youngs_rod * A
-        EI = material.youngs_rod * (geom.ixs1 if geom.ixs1 else jnp.pi * geom.r0**4 / 4)
-
-        # Rescale
-        EA *= l_k
-        EI /= l_k
-
-        return cls(jnp.array([EA, EA, EI]))
 
     def __call__(self, del_strain: jax.Array) -> jax.Array:
         return jnp.sum(self.K * del_strain**2)

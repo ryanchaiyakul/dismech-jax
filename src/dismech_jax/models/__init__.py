@@ -1,1 +1,3 @@
-from .der import DER, DER2D
+from .der import DER
+
+__all__ = ["DER"]

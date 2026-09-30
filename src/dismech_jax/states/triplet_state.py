@@ -1,9 +1,12 @@
 from __future__ import annotations
+
+from typing import Self
+
 import jax
 import jax.numpy as jnp
 
+from ..util import get_ref_twist, parallel_transport
 from .state import State
-from ..util import parallel_transport, get_ref_twist
 
 
 class TripletState(State):
@@ -11,7 +14,7 @@ class TripletState(State):
     d1: jax.Array  # [[d1e], [d1f]]
     beta: jax.Array  # beta
 
-    def update(self, q: jax.Array) -> TripletState:
+    def update(self, q: jax.Array) -> Self:
         te_old, tf_old = self.t
         d1e_old, d1f_old = self.d1
         beta_old = self.beta
@@ -27,4 +30,4 @@ class TripletState(State):
         t_new = jnp.array([te, tf])
         d1_new = jnp.array([d1e, d1f])
         beta_new = get_ref_twist(d1e, d1f, te, tf, beta_old)
-        return TripletState(t_new, d1_new, beta_new)
+        return type(self)(t_new, d1_new, beta_new)

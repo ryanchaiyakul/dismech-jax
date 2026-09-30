@@ -1,16 +1,14 @@
 from abc import abstractmethod
-from typing import Generic, Self, TypeVar
+from typing import Self
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 
 from ..states import State
 
-AuxT = TypeVar("AuxT", bound=State | None)
 
-
-class Stencil(eqx.Module, Generic[AuxT]):
+class Stencil[AuxT: State | None](eqx.Module):
     """DDG stencils."""
 
     bar_strain: jax.Array
@@ -31,18 +29,22 @@ class Stencil(eqx.Module, Generic[AuxT]):
         return cls(bar_strain=bar_strain, **kwargs)
 
     def get_energy(self, q: jax.Array, model: eqx.Module, aux: AuxT) -> jax.Array:
-        """Get scalar energy.
+        """Get scalar energy `measure * model(del_strain)`.
 
         Args:
             q (jax.Array): local DOFs.
-            model (eqx.Module): Equinox model: `f(del_strain)-> scalar`.
+            model (eqx.Module): Equinox model: `f(del_strain) -> energy density`.
             aux (State | None, optional): Aux variables. Defaults to None.
 
         Returns:
             jax.Array: Scalar energy.
         """
         del_strain = self.get_strain(q, aux) - self.bar_strain
-        return model(del_strain)  # type: ignore
+        return self.get_measure() * model(del_strain)  # type: ignore
+
+    def get_measure(self) -> jax.Array:
+        """Get the stencil's integration measure (e.g. Voronoi length). Default is 1."""
+        return jnp.ones(())
 
     @abstractmethod
     def get_strain(self, q: jax.Array, aux: AuxT) -> jax.Array:

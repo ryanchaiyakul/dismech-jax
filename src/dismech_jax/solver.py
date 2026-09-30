@@ -1,203 +1,139 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 
-from .states import State
-from .systems import System
+if TYPE_CHECKING:
+    from .system import Aux, System
 
 
-def compute_ift_gradient(
-    _lambda: jax.Array,
-    q_star: jax.Array,
-    grad_obj: jax.Array,
-    model: eqx.Module,
-    aux: State,
+def _stop_gradient(tree):
+    dynamic, static = eqx.partition(tree, eqx.is_inexact_array)
+    return eqx.combine(jax.lax.stop_gradient(dynamic), static)
+
+
+def _newton(
     sys: System,
-) -> eqx.Module:
-    H = sys.get_H(_lambda, q_star, model, aux)
-    H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
-    v = jnp.linalg.solve(H_reg, grad_obj)
-    _, vjp_fn = jax.vjp(lambda _m: sys.get_F(_lambda, q_star, _m, aux), model)
-    (grads,) = vjp_fn(-v)
-    return grads
-
-
-@eqx.filter_custom_vjp
-@eqx.filter_jit
-def solve_step(
-    model: eqx.Module,
-    _lambda: jax.Array,
+    t: jax.Array,
     q0: jax.Array,
-    aux: State,
-    sys: System,
-    iters: int = 10,
-    ls_steps: int = 10,
-    c1: float = 1e-4,
+    aux: Aux,
+    iters: int,
+    ls_steps: int,
+    c1: float,
 ) -> jax.Array:
     alphas = 0.5 ** jnp.arange(ls_steps)
 
     def newton_step(carry, _):
-        q, e_old, res = carry
+        q, m_old, res = carry
 
         # TODO: use SOCU for blockdiagonal
-        H = sys.get_H(_lambda, q, model, aux)
+        H = sys.jacobian(q, t, aux)
         H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
         delta_q = jnp.linalg.solve(H_reg, res)
-        slope = jnp.dot(res, delta_q)
+        # Descent rate of the merit along the Newton direction
+        slope = jnp.dot(res, delta_q) if sys.is_conservative else jnp.dot(res, res)
 
         # Parallel line search
         test_qs = q + alphas[:, None] * delta_q
-        test_energies = jax.vmap(lambda _q: sys.get_E(_lambda, _q, model, aux))(test_qs)
+        test_merits = jax.vmap(lambda _q: sys.merit(_q, t, aux))(test_qs)
 
         # If Armijo fails, take the smallest possible step
-        is_good = test_energies <= e_old - c1 * alphas * slope  # Armijo Condition
+        is_good = test_merits <= m_old - c1 * alphas * slope  # Armijo Condition
         safe_idx = jnp.where(jnp.any(is_good), jnp.argmax(is_good), ls_steps - 1)
 
         next_q = test_qs[safe_idx]
-        next_e = test_energies[safe_idx]
-        next_res = -sys.get_F(_lambda, next_q, model, aux)
+        next_m = test_merits[safe_idx]
+        next_res = -sys.residual(next_q, t, aux)
 
-        return (next_q, next_e, next_res), jnp.linalg.norm(next_res)
+        return (next_q, next_m, next_res), jnp.linalg.norm(next_res)
 
-    q_init = sys.get_q(_lambda, q0)
-    init_e = sys.get_E(_lambda, q_init, model, aux)
-    init_res = -sys.get_F(_lambda, q_init, model, aux)
-    (final_q, _, final_res), _ = jax.lax.scan(
-        newton_step, (q_init, init_e, init_res), None, iters
+    q_init = sys.bc.apply(q0, t)
+    init_m = sys.merit(q_init, t, aux)
+    init_res = -sys.residual(q_init, t, aux)
+    (final_q, _, _), _ = jax.lax.scan(
+        newton_step, (q_init, init_m, init_res), None, iters
     )
-    # jax.debug.print("{}", jnp.linalg.norm(final_res))
     return final_q
 
 
-@solve_step.def_fwd
-def solve_step_fwd(
-    perturbed: eqx.Module,
-    model: eqx.Module,
-    _lambda: jax.Array,
-    q0: jax.Array,
-    aux: State,
+@eqx.filter_jit
+def solve_step(
     sys: System,
+    t: jax.Array,
+    q0: jax.Array,
+    aux: Aux,
     iters: int = 10,
     ls_steps: int = 10,
     c1: float = 1e-4,
-) -> tuple[jax.Array, jax.Array]:
-    final_q = solve_step(model, _lambda, q0, aux, sys, iters, ls_steps, c1)
-    return final_q, final_q
+) -> jax.Array:
+    """Solve `sys.residual(q, t, aux) = 0` starting from `q0`.
+
+    Differentiable (forward and reverse mode) w.r.t. every array in `sys`,
+    `aux` and `t` via the implicit function theorem. `q0` is only an initial
+    guess and receives no gradient.
+    """
+    # Newton iterations are never differentiated through
+    q_star = _newton(*_stop_gradient((sys, t, q0, aux)), iters, ls_steps, c1)
+    H = jax.lax.stop_gradient(sys.jacobian(q_star, t, aux))
+    H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
+
+    return jax.lax.custom_root(
+        lambda q: sys.residual(q, t, aux),
+        q_star,
+        lambda _f, q: q,  # already solved
+        lambda _g, y: jnp.linalg.solve(H_reg, y),
+    )
 
 
-@solve_step.def_bwd
-def solve_step_bwd(
-    res: jax.Array,
-    grad_obj: jax.Array,
-    perturbed: eqx.Module,
-    model: eqx.Module,
-    _lambda: jax.Array,
-    q0: jax.Array,
-    aux: State,
-    sys: System,
-    iters: int = 10,
-    ls_steps: int = 10,
-    c1: float = 1e-4,
-) -> eqx.Module:
-    return compute_ift_gradient(_lambda, res, grad_obj, model, aux, sys)
-
-
-@eqx.filter_custom_vjp
 @eqx.filter_jit
 def solve(
-    model: eqx.Module,
-    lambdas: jax.Array,
-    q0: jax.Array,
-    aux: State,
     sys: System,
+    ts: jax.Array,
+    aux: Aux,
+    q0: jax.Array | None = None,
     iters: int = 10,
     ls_steps: int = 10,
     c1: float = 1e-4,
-    max_dt: float = 1e-1,
+    substeps: int = 1,
 ) -> jax.Array:
-    def scan_fn(res: tuple[jax.Array, State, jax.Array], target_lambda: jax.Array):
-        _q, _aux, _current_lambda = res
+    """Solve for the quasi-static equilibrium at every `t` in `ts`.
 
-        def cond_fn(val: tuple[jax.Array, State, jax.Array]):
-            _, _, curr_L = val
-            return curr_L < target_lambda
+    Gradients are exact w.r.t. every array in `sys` (e.g. rest strain, BC
+    values, material models), `aux` and `ts`, including the path dependence
+    through the aux updates between steps.
 
-        def body_fn(carry: tuple[jax.Array, State, jax.Array]):
-            q, aux, curr_L = carry
-            next_L = jnp.minimum(curr_L + max_dt, target_lambda)
-            new_q = solve_step(model, next_L, q, aux, sys, iters, ls_steps, c1)
-            new_aux = jax.vmap(lambda a: a.update(new_q))(aux) if aux else aux
-            return new_q, new_aux, next_L
+    Args:
+        sys (System): system.
+        ts (jax.Array): times `(N,)`.
+        aux (Aux): initial aux state, aligned with `sys.terms`.
+        q0 (jax.Array | None, optional): initial guess. Defaults to `sys.q0`.
+        iters (int, optional): Number of newton-raphson iterations. Defaults to 10.
+        ls_steps (int, optional): Number of alphas evaluated. Defaults to 10.
+        c1 (float, optional): Armijo coefficient. Defaults to 1e-4.
+        substeps (int, optional): Equal substeps between consecutive
+            `ts`. Defaults to 1.
 
-        final_q, final_aux, final_L = jax.lax.while_loop(
-            cond_fn, body_fn, (_q, _aux, _current_lambda)
-        )
-        return (final_q, final_aux, final_L), final_q
+    Returns:
+        jax.Array: Solved state `(N, # of DOFs)`.
+    """
+    q0 = sys.q0 if q0 is None else q0
 
-    # jax.lax.while_loop is not a do while
-    q_start = solve_step(model, lambdas[0], q0, aux, sys, iters, ls_steps, c1)
-    aux_start = jax.vmap(lambda a: a.update(q_start))(aux) if aux else aux
-    _, qs = jax.lax.scan(scan_fn, (q_start, aux_start, lambdas[0]), lambdas)
-    return qs
+    def step(carry, t):
+        q, aux = carry
+        q = solve_step(sys, t, q, aux, iters, ls_steps, c1)
+        return (q, sys.update(aux, q)), None
 
+    def outer(carry, sub_ts):
+        carry, _ = jax.lax.scan(step, carry, sub_ts)
+        return carry, carry[0]
 
-@solve.def_fwd
-def solve_fwd(
-    perturbed: eqx.Module,
-    model: eqx.Module,
-    lambdas: jax.Array,
-    q0: jax.Array,
-    aux: State,
-    sys: System,
-    iters: int = 10,
-    ls_steps: int = 10,
-    c1: float = 1e-4,
-    max_dt: float = 1e-1,
-) -> tuple[jax.Array, tuple[jax.Array, State]]:
-    def scan_fwd_fn(res: tuple[jax.Array, State, jax.Array], target_lambda: jax.Array):
-        _q, _aux, _current_lambda = res
+    carry, _ = step((q0, aux), ts[0])
 
-        def cond_fn(val):
-            _, _, curr_L = val
-            return curr_L < target_lambda
-
-        def body_fn(val):
-            q, aux, curr_L = val
-            next_L = jnp.minimum(curr_L + max_dt, target_lambda)
-
-            new_q = solve_step(model, next_L, q, aux, sys, iters, ls_steps, c1)
-            new_aux = jax.vmap(lambda a: a.update(new_q))(aux) if aux else aux
-
-            return new_q, new_aux, next_L
-
-        final_q, final_aux, final_L = jax.lax.while_loop(
-            cond_fn, body_fn, (_q, _aux, _current_lambda)
-        )
-        return (final_q, final_aux, final_L), (final_q, _aux)
-
-    _, (qs, auxs) = jax.lax.scan(
-        scan_fwd_fn, (q0, aux, jnp.asarray(lambdas[0], dtype=lambdas.dtype)), lambdas
-    )
-    return qs, (qs, auxs)
-
-
-@solve.def_bwd
-def solve_bwd(
-    res: tuple[jax.Array, State],
-    grad_obj: jax.Array,
-    perturbed: eqx.Module,
-    model: eqx.Module,
-    lambdas: jax.Array,
-    q0: jax.Array,
-    aux: State,
-    sys: System,
-    iters: int = 10,
-    ls_steps: int = 10,
-    c1: float = 1e-4,
-    max_dt: float = 1e9,
-) -> eqx.Module:
-    qs, auxs = res
-    batched_ift_fn = jax.vmap(compute_ift_gradient, in_axes=(0, 0, 0, None, 0, None))
-    batched_grads = batched_ift_fn(lambdas, qs, grad_obj, model, auxs, sys)
-    total_grad = jax.tree.map(lambda x: jnp.sum(x, axis=0), batched_grads)
-    return total_grad
+    # Equal substeps between consecutive `ts`, ending exactly on each `t`
+    fracs = jnp.arange(1, substeps + 1, dtype=ts.dtype) / substeps
+    sub_ts = ts[:-1, None] + (ts[1:] - ts[:-1])[:, None] * fracs
+    _, qs = jax.lax.scan(outer, carry, sub_ts)
+    return jnp.concatenate([carry[0][None], qs])

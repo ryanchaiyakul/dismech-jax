@@ -1,2 +1,4 @@
-from .triplet import Triplet, Triplet2D
 from .stencil import Stencil
+from .triplet import Triplet
+
+__all__ = ["Stencil", "Triplet"]
