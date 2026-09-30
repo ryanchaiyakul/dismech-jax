@@ -6,11 +6,11 @@ import jax.numpy as jnp
 
 from ..bc import AbstractBC
 from ..forces import Gravity, StencilEnergy
-from ..legacy import Geometry, Material
 from ..models import DER
 from ..states import TripletState
 from ..stencils import Triplet
 from ..system import System
+from .params import Geometry, Material
 
 
 def make_rod(

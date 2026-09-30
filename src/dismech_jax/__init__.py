@@ -1,7 +1,6 @@
 from .bc import AbstractBC, LinearBC
-from .builders import make_rod
 from .forces import Energy, Force, Gravity, StencilEnergy
-from .legacy import Geometry, Material
+from .legacy import Geometry, Material, make_rod
 from .models import DER
 from .solver import solve, solve_step
 from .states import State, TripletState
