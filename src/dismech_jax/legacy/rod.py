@@ -21,6 +21,7 @@ def make_rod(
     gravity: jax.Array | None = None,
     model: eqx.Module | None = None,
     extra_terms: tuple[Energy, ...] = (),
+    block_size: int | None = None,
 ) -> tuple[System, tuple]:
     """Build a discrete elastic rod with DOFs `[x0, y0, z0, theta0, x1, ..., zN]`.
 
@@ -42,6 +43,9 @@ def make_rod(
             `DER.from_legacy(geom, material)`.
         extra_terms (tuple[Energy, ...], optional): Additional aux-free energy
             terms. Defaults to none.
+        block_size (int | None, optional): Block size of the block tridiagonal
+            Newton solve (see `System.create`). A triplet spans 11 consecutive
+            DOFs, so 8 is the smallest valid size. Defaults to None (dense).
 
     Returns:
         tuple[System, tuple]: System and initial aux.
@@ -90,9 +94,14 @@ def make_rod(
     F_ext = F_reshaped.ravel()[:-1]
 
     rod = System.create(
-        terms=(StencilEnergy(triplets, conn, model), ConstantForceEnergy(F_ext), *extra_terms),
+        terms=(
+            StencilEnergy(triplets, conn, model),
+            ConstantForceEnergy(F_ext),
+            *extra_terms,
+        ),
         q0=q0,
         fixed=fixed,
+        block_size=block_size,
     )
     return rod, (batch_aux, None, *[None] * len(extra_terms))
 

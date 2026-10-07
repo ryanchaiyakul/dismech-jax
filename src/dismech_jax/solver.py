@@ -34,9 +34,7 @@ def _newton(
     def newton_step(carry):
         x, e_old, res, k = carry
 
-        H, _ = sys.hessian(x, z, aux)
-        H_reg = H.at[jnp.diag_indices(H.shape[0])].add(1e-8)
-        delta_x = jnp.linalg.solve(H_reg, res)
+        delta_x = sys.linear_solver(x, z, aux)(res)
 
         # `res` is -grad(E), so `slope > 0` iff `delta_x` is a descent direction.
         # If H is indefinite it may not be: use steepest descent.
@@ -81,8 +79,8 @@ def _solve_one(
     x_star, res_norm = _newton(
         *_stop_gradient((sys, z, x0, aux)), iters, ls_steps, c1, tol
     )
-    H, _ = sys.hessian(x_star, z, aux)
-    H_reg = jax.lax.stop_gradient(H).at[jnp.diag_indices(H.shape[0])].add(1e-8)
+    sys_sg, x_sg, z_sg, aux_sg = _stop_gradient((sys, x_star, z, aux))
+    solve_H = sys_sg.linear_solver(x_sg, z_sg, aux_sg)
 
     # Implicit function theorem: dx/dp = -H_xx^-1 d(residual)/dp, where `p` is
     # anything in `sys`, `z` or `aux`.
@@ -90,7 +88,7 @@ def _solve_one(
         lambda x: sys.residual(x, z, aux),
         x_star,
         lambda _f, x: x,  # already solved
-        lambda _g, y: jnp.linalg.solve(H_reg, y),
+        lambda _g, y: solve_H(y),
     )
     return x, res_norm
 

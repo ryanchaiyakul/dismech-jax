@@ -17,3 +17,7 @@ class ConstantForceEnergy(Energy[None]):
 
     def H(self, q: jax.Array, aux: None) -> jax.Array:
         return jnp.zeros((q.shape[0], q.shape[0]), dtype=q.dtype)
+
+    def H_blocks(self, q: jax.Array, aux: None, b: int) -> tuple[jax.Array, jax.Array]:
+        nb = -(-q.shape[0] // b)
+        return jnp.zeros((nb, b, b), q.dtype), jnp.zeros((nb - 1, b, b), q.dtype)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import equinox as eqx
@@ -8,7 +8,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .energies import Energy
+from .energies import Energy, StencilEnergy
+from .linalg import (
+    block_tridiag_factor,
+    block_tridiag_matvec,
+    block_tridiag_solve_factored,
+)
 from .solver import solve
 
 type Aux = tuple[Any, ...]
@@ -19,19 +24,42 @@ class System(eqx.Module):
     idx_x: jax.Array
     idx_z: jax.Array
     q0: jax.Array
+    block_size: int | None = eqx.field(static=True, default=None)
 
     @classmethod
     def create(
-        cls, terms: Sequence[Energy], q0: jax.Array, fixed: jax.Array | Sequence[int]
+        cls,
+        terms: Sequence[Energy],
+        q0: jax.Array,
+        fixed: jax.Array | Sequence[int],
+        block_size: int | None = None,
     ) -> System:
         """Build a system from `terms`, the initial state `q0` and the indices of
-        the fixed DOFs `fixed`."""
+        the fixed DOFs `fixed`.
+
+        With `block_size`, the Hessian is treated as block tridiagonal with blocks
+        of `block_size` DOFs and Newton uses a block Thomas solve (`O(n b^2)`)
+        instead of a dense one (`O(n^3)`). Every term must implement `H_blocks`
+        and every stencil must span at most two consecutive blocks."""
         n = q0.shape[0]
         fixed = np.unique(np.asarray(fixed, dtype=int))
         if fixed.size and (fixed[0] < 0 or fixed[-1] >= n):
             raise ValueError("`fixed` contains an index outside of the state.")
         free = np.setdiff1d(np.arange(n), fixed)
-        return cls(tuple(terms), jnp.asarray(free), jnp.asarray(fixed), q0)
+        if block_size is not None:
+            for term in terms:
+                if isinstance(term, StencilEnergy):
+                    conn = np.asarray(term.conn)
+                    span = (
+                        conn.max(axis=1) // block_size - conn.min(axis=1) // block_size
+                    )
+                    if np.any(span > 1):
+                        raise ValueError(
+                            f"`block_size={block_size}` is too small: a stencil spans "
+                            f"{int(span.max()) + 1} blocks, so the Hessian is not "
+                            "block tridiagonal."
+                        )
+        return cls(tuple(terms), jnp.asarray(free), jnp.asarray(fixed), q0, block_size)
 
     @property
     def n_dofs(self) -> int:
@@ -90,6 +118,49 @@ class System(eqx.Module):
             jnp.zeros((self.n_dofs, self.n_dofs), dtype=q.dtype),
         )
         return H[jnp.ix_(self.idx_x, self.idx_x)], H[jnp.ix_(self.idx_x, self.idx_z)]
+
+    def linear_solver(
+        self, x: jax.Array, z: jax.Array, aux: Aux, reg: float = 1e-8
+    ) -> Callable[[jax.Array], jax.Array]:
+        """`v -> (H_xx + reg I)^-1 v` at the state `(x, z)`.
+
+        Dense unless `block_size` is set, then block tridiagonal."""
+        if self.block_size is None:
+            H, _ = self.hessian(x, z, aux)
+            H = H.at[jnp.diag_indices(H.shape[0])].add(reg)
+            return lambda v: jnp.linalg.solve(H, v)
+
+        b, q = self.block_size, self.join(x, z)
+        D, L = (
+            sum(Ds)
+            for Ds in zip(
+                *(f.H_blocks(q, a, b) for f, a in zip(self.terms, aux, strict=True))
+            )
+        )
+        # Keep the full-state layout so the blocks stay aligned: fixed and padding
+        # DOFs get identity rows and columns (decoupled, solution 0).
+        nb = D.shape[0]
+        m = jnp.zeros(nb * b, q.dtype).at[self.idx_x].set(1.0).reshape(nb, b)
+        D = D * m[:, :, None] * m[:, None, :] + jax.vmap(jnp.diag)(1.0 - m + reg * m)
+        L = L * m[1:, :, None] * m[:-1, None, :]
+        factors = block_tridiag_factor(D, L)
+
+        def solve_blocks(v: jax.Array) -> jax.Array:
+            r = (
+                jnp.zeros(nb * b, v.dtype)
+                .at[self.idx_x]
+                .set(v, unique_indices=True)
+                .reshape(nb, b)
+            )
+            x = jax.lax.custom_linear_solve(  # transposes as a solve (see linalg)
+                lambda y: block_tridiag_matvec(D, L, y),
+                r,
+                lambda _matvec, r: block_tridiag_solve_factored(factors, r),
+                symmetric=True,
+            )
+            return x.reshape(-1)[self.idx_x]
+
+        return solve_blocks
 
     def update(self, aux: Aux, x: jax.Array, z: jax.Array) -> Aux:
         """Update each term's aux at the state `(x, z)`."""
