@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+# Hoffman2 cluster
+.secrets
+hoffman2_data/
+data/
