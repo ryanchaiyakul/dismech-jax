@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .energies import Energy, StencilEnergy
+from .energies import Attractor, Energy, Leading, StencilEnergy
 from .linalg import (
     block_tridiag_factor,
     block_tridiag_matvec,
     block_tridiag_solve_factored,
 )
 from .solver import solve
+
+if TYPE_CHECKING:
+    from .acceptance import Accept
+    from .directions import Direction
+    from .predictors import Predictor
 
 type Aux = tuple[Any, ...]
 
@@ -60,6 +65,29 @@ class System(eqx.Module):
                             "block tridiagonal."
                         )
         return cls(tuple(terms), jnp.asarray(free), jnp.asarray(fixed), q0, block_size)
+
+    def with_attractor(
+        self, aux: Aux, idx: jax.Array | Sequence[int]
+    ) -> tuple[System, Aux]:
+        """Append an `Attractor` pulling the DOFs `idx` toward targets.
+
+        The state gets `len(idx) + 1` fixed ghost DOFs at its end, the targets
+        then the stiffness `k`, so the fixed DOFs become `[z, target, k]`
+        (`z` as before) and both can change every load step through `zs`.
+        `x` is unchanged. In `sys.z0` the targets are `q0[idx]` and `k = 0`.
+        Dense only (the ghost DOFs break the block structure)."""
+        if self.block_size is not None:
+            raise ValueError("`with_attractor` needs a dense system.")
+        n, idx = self.n_dofs, jnp.asarray(idx)
+        m = idx.shape[0]
+        q0 = jnp.concatenate([self.q0, self.q0[idx], jnp.zeros(1, self.q0.dtype)])
+        attractor = Attractor(idx, n + jnp.arange(m), jnp.asarray(n + m))
+        sys = System.create(
+            (*(Leading(t, n) for t in self.terms), attractor),
+            q0,
+            np.concatenate([np.asarray(self.idx_z), n + np.arange(m + 1)]),
+        )
+        return sys, (*aux, None)
 
     @property
     def n_dofs(self) -> int:
@@ -176,6 +204,27 @@ class System(eqx.Module):
         ls_steps: int = 10,
         c1: float = 1e-4,
         tol: float = 1e-10,
-    ) -> tuple[jax.Array, jax.Array]:
+        direction: Direction | None = None,
+        predictor: Predictor | None = None,
+        accept: Accept | None = None,
+        passes: int = 1,
+        z0: jax.Array | None = None,
+        return_aux: bool = False,
+    ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, Aux]:
         """Solve for equilibrium at each fixed state in `zs`. See `solver.solve`."""
-        return solve(self, zs, aux, x0, iters, ls_steps, c1, tol)
+        return solve(
+            self,
+            zs,
+            aux,
+            x0,
+            iters,
+            ls_steps,
+            c1,
+            tol,
+            direction,
+            predictor,
+            accept,
+            passes,
+            z0,
+            return_aux,
+        )

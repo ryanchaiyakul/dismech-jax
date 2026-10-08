@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from conftest import G, L, R0, RHO
 
-from dismech_jax import Geometry, Material, make_rod
+from dismech_jax import Geometry, Material, Newton, make_rod
 from dismech_jax.linalg import block_tridiag_solve
 
 
@@ -64,9 +64,11 @@ def test_matches_dense():
 
 def test_grad_matches_dense():
     def tip_z(rod, aux, s):
-        # Lift the clamp (node 1 z) over a few load steps (path dependent)
+        # Lift the clamp (node 1 z) over a few load steps (path dependent). The
+        # hanging soft rod has a (twist) saddle, so compare the same plain Newton
+        # step: the saddle-free default would leave it, which the block solve can't.
         zs = jnp.tile(rod.z0, (3, 1)).at[:, 6].set(s * jnp.arange(1, 4) / 3)
-        xs, _ = rod.solve(zs, aux, iters=30)
+        xs, _ = rod.solve(zs, aux, iters=30, direction=Newton())
         return rod.join(xs[-1], zs[-1])[-1]  # tip z
 
     (dense, aux), (block, _) = _rod(21, None), _rod(21, 8)
